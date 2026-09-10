@@ -1,3 +1,4 @@
+pub mod access_model;
 pub mod catalog;
 pub mod config;
 pub mod config_json;
@@ -7,6 +8,7 @@ pub mod native_result;
 pub mod params;
 pub mod polyglot_pool;
 pub mod query;
+pub mod schema_context;
 pub mod security_setting;
 pub mod session;
 pub mod sql_classify;

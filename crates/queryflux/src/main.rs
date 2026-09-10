@@ -3889,14 +3889,25 @@ mod tests {
     }
 
     mod guard_chains {
-        use std::collections::HashMap;
+        use std::collections::{BTreeMap, HashMap};
 
         use queryflux_core::config::{GuardKindConfig, GuardSpecConfig, GuardrailsConfig};
-        use queryflux_core::query::{ClusterGroupName, EngineType};
+        use queryflux_core::query::{ClusterGroupName, EngineType, SqlDialect};
         use queryflux_core::tags::QueryTags;
-        use queryflux_guardrails::context::{GuardContext, GuardLayer};
+        use queryflux_guardrails::context::{GuardChainOutcome, GuardContext, GuardLayer};
 
         use super::super::{build_chain_from_db_specs, build_chain_from_yaml_specs};
+
+        fn is_blocked(o: &GuardChainOutcome) -> bool {
+            matches!(o, GuardChainOutcome::Blocked { .. })
+        }
+
+        static EMPTY_S: Vec<String> = Vec::new();
+        static GENERIC_DIALECT: SqlDialect = SqlDialect::Generic;
+        static EMPTY_ATTRS: std::sync::LazyLock<BTreeMap<String, serde_json::Value>> =
+            std::sync::LazyLock::new(BTreeMap::new);
+        static EMPTY_EXTRA: std::sync::LazyLock<HashMap<String, String>> =
+            std::sync::LazyLock::new(HashMap::new);
 
         fn plan_ctx<'a>(
             engine: &'a EngineType,
@@ -3905,12 +3916,17 @@ mod tests {
         ) -> GuardContext<'a> {
             GuardContext {
                 sql: "SELECT 1",
-                translated_sql: "SELECT 1",
+                dialect: &GENERIC_DIALECT,
                 engine_type: engine,
                 cluster_group: group,
                 user: Some("alice"),
+                groups: &EMPTY_S,
+                roles: &EMPTY_S,
+                attributes: &EMPTY_ATTRS,
                 agent_context: None,
                 query_tags: tags,
+                session_extra: &EMPTY_EXTRA,
+                schema: None,
                 sql_parse: None,
             }
         }
@@ -3936,8 +3952,8 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked);
+            let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome));
             assert_eq!(actions.len(), 1);
             assert_eq!(actions[0].guard, "built_in");
             assert_eq!(actions[0].action, "deny");
@@ -3973,8 +3989,8 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked);
+            let (_, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome));
         }
 
         #[tokio::test]
@@ -3986,8 +4002,8 @@ mod tests {
             let chain =
                 build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked);
+            let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome));
             assert_eq!(actions[0].guard, "guard");
             assert!(actions[0]
                 .reason
@@ -4017,8 +4033,8 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(!blocked);
+            let (_, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(!is_blocked(&outcome));
         }
 
         #[tokio::test]
@@ -4044,8 +4060,8 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked, "non-http(s) webhook URL must deny at construction");
+            let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome), "non-http(s) webhook URL must deny at construction");
             assert_eq!(actions[0].guard, "http_webhook");
             assert!(actions[0]
                 .reason
@@ -4077,9 +4093,9 @@ mod tests {
             let chain = build_chain_from_yaml_specs(&specs, &HashMap::new())
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (_, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
+            let (_, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
             assert!(
-                !blocked,
+                !is_blocked(&outcome),
                 "valid http(s) webhook with fail_open must allow when unreachable"
             );
         }
@@ -4097,8 +4113,8 @@ mod tests {
             let chain =
                 build_chain_from_db_specs(&specs, &HashMap::new()).expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
-            let (actions, blocked) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(blocked);
+            let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
+            assert!(is_blocked(&outcome));
             assert_eq!(actions[0].guard, "http_webhook");
             assert!(actions[0]
                 .reason

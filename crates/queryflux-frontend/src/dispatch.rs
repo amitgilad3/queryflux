@@ -25,8 +25,14 @@ use queryflux_engine_adapters::{
     wire_auth::{enrich_session_for_passthrough, resolve_stored_wire_auth},
     AdapterKind, AsyncAdapter, BackendQueryIdSlot, ConnectionFormat, SyncAdapter,
 };
-use queryflux_guardrails::{GuardChain, GuardContext, GuardLayer};
+use queryflux_guardrails::{GuardChain, GuardChainOutcome, GuardContext, GuardLayer};
 use queryflux_metrics::MetricsStore;
+
+/// Empty identity references for guard-context construction sites that do not (yet)
+/// carry a verified `AuthContext` — e.g. the cache-path guard check.
+static EMPTY_STRINGS: &[String] = &[];
+static EMPTY_ATTRS: std::sync::LazyLock<std::collections::BTreeMap<String, serde_json::Value>> =
+    std::sync::LazyLock::new(std::collections::BTreeMap::new);
 
 use tracing::{debug, info, warn};
 
@@ -406,13 +412,18 @@ pub async fn dispatch_query(
         queryflux_core::sql_classify::SqlParseCache::new(sql.clone(), tgt_dialect.clone());
 
     let guard_ctx = GuardContext {
-        sql: &original_sql,
-        translated_sql: &sql,
+        sql: &sql,
+        dialect: &tgt_dialect,
         engine_type: &engine_type,
         cluster_group: &group,
         user: session.user(),
+        groups: &auth_ctx.groups,
+        roles: &auth_ctx.roles,
+        attributes: &auth_ctx.attributes,
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: &effective_tags,
+        session_extra: &session.extra,
+        schema: None,
         sql_parse: Some(&sql_parse),
     };
 
@@ -466,20 +477,17 @@ pub async fn dispatch_query(
         }};
     }
 
-    if let Some(chain) = &guard_chain {
-        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+    for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
         all_guard_actions.extend(actions);
-        if was_blocked {
+        if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
             guard_deny!(std::mem::take(&mut all_guard_actions));
         }
-    }
-
-    if let Some(chain) = &group_guard_chain {
-        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
-        all_guard_actions.extend(actions);
-        if was_blocked {
-            guard_deny!(std::mem::take(&mut all_guard_actions));
-        }
+        // NOTE (Phase 4): a `GuardChainOutcome::Proceed { sql: Some(_) }` rewrite is
+        // applied by the reworked pre-translation stage; no guard produces one here yet.
     }
 
     // Serialize guard actions for storage in ExecutingQuery (retrieved at poll time).
@@ -1834,12 +1842,17 @@ async fn run_plan_guards(
     );
     let guard_ctx = GuardContext {
         sql,
-        translated_sql: sql,
+        dialect: &queryflux_core::query::SqlDialect::Generic,
         engine_type: &engine_type,
         cluster_group: group,
         user: session.user(),
+        groups: EMPTY_STRINGS,
+        roles: EMPTY_STRINGS,
+        attributes: &EMPTY_ATTRS,
         agent_context: resolved_agent_ctx.as_ref(),
         query_tags: effective_tags,
+        session_extra: &session.extra,
+        schema: None,
         sql_parse: Some(&sql_parse),
     };
 
@@ -1848,9 +1861,9 @@ async fn run_plan_guards(
         .into_iter()
         .flatten()
     {
-        let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+        let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
         all_actions.extend(actions);
-        if was_blocked {
+        if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
             return Err(all_actions
                 .iter()
                 .find(|a| a.action == "deny")
@@ -2109,13 +2122,18 @@ async fn execute_to_sink_inner(
     {
         let ctx = &setup.ctx;
         let guard_ctx = GuardContext {
-            sql: &ctx.sql,
-            translated_sql: ctx.translated_sql.as_deref().unwrap_or(&setup.translated),
+            sql: ctx.translated_sql.as_deref().unwrap_or(&setup.translated),
+            dialect: &ctx.tgt_dialect,
             engine_type: &ctx.engine_type,
             cluster_group: &ctx.group,
             user: ctx.session.user(),
+            groups: &auth_ctx.groups,
+            roles: &auth_ctx.roles,
+            attributes: &auth_ctx.attributes,
             agent_context: ctx.agent_context.as_ref(),
             query_tags: &ctx.query_tags,
+            session_extra: &ctx.session.extra,
+            schema: None,
             sql_parse: Some(&setup.sql_parse),
         };
 
@@ -2125,9 +2143,9 @@ async fn execute_to_sink_inner(
             .into_iter()
             .flatten()
         {
-            let (actions, was_blocked) = chain.run(&guard_ctx, GuardLayer::Plan).await;
+            let (actions, outcome) = chain.run(&guard_ctx, GuardLayer::Plan).await;
             all_actions.extend(actions);
-            if was_blocked {
+            if matches!(outcome, GuardChainOutcome::Blocked { .. }) {
                 let deny_reason = all_actions
                     .iter()
                     .find(|a| a.action == "deny")

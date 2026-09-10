@@ -6,23 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use queryflux_core::{catalog::CatalogProvider, error::Result, query::SqlDialect};
+pub use queryflux_core::schema_context::SchemaContext;
 pub use sqlglot::{extract_table_refs_async, SqlglotTranslator, TableRef};
-
-/// Schema context passed to the translator so sqlglot can produce accurate output.
-/// Maps table name → { column name → SQL type string }.
-#[derive(Debug, Default, Clone)]
-pub struct SchemaContext {
-    pub catalog: Option<String>,
-    pub database: Option<String>,
-    /// table_name → { col_name → type_string }
-    pub tables: HashMap<String, HashMap<String, String>>,
-}
-
-impl SchemaContext {
-    pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
-    }
-}
 
 /// Translates SQL from one dialect to another.
 ///
