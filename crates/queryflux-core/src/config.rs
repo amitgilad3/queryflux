@@ -476,6 +476,11 @@ pub struct OidcConfig {
     /// JWT claim name for roles (e.g. `"realm_access.roles"` for Keycloak).
     #[serde(default)]
     pub roles_claim: Option<String>,
+    /// JWT claim paths (dot-notation) copied into `AuthContext.attributes` as verified ABAC
+    /// attributes for data-level policy — e.g. `["department", "region", "data_classification"]`.
+    /// Each path's value is stored under its last segment; missing paths are skipped.
+    #[serde(default)]
+    pub attribute_claims: Vec<String>,
 }
 
 fn default_groups_claim() -> String {
@@ -3220,6 +3225,7 @@ queryflux:
                 audience: None,
                 groups_claim: "groups".into(),
                 roles_claim: None,
+                attribute_claims: vec![],
             }),
             ..Default::default()
         };
@@ -3238,6 +3244,7 @@ queryflux:
                 audience: Some("queryflux".into()),
                 groups_claim: "groups".into(),
                 roles_claim: None,
+                attribute_claims: vec![],
             }),
             ..Default::default()
         };
