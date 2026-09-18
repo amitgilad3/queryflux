@@ -1549,7 +1549,10 @@ async fn setup_sync_query(
                 pre_guard_actions.push(action);
                 sql.clone()
             }
-            AccessStageOutcome::Rewritten { sql: rewritten, action } => {
+            AccessStageOutcome::Rewritten {
+                sql: rewritten,
+                action,
+            } => {
                 pre_guard_actions.push(action);
                 rewritten
             }
@@ -2305,8 +2308,7 @@ async fn execute_to_sink_inner(
 
         // Start from the access-control action recorded pre-translation (see
         // `setup_sync_query`) so the audit trail carries the whole pipeline.
-        let mut all_actions: Vec<queryflux_persistence::GuardAction> =
-            setup.guard_actions.clone();
+        let mut all_actions: Vec<queryflux_persistence::GuardAction> = setup.guard_actions.clone();
 
         for chain in [guard_chain.as_ref(), group_guard_chain.as_ref()]
             .into_iter()
