@@ -4061,7 +4061,10 @@ mod tests {
                 .expect("chain should be built");
             let ctx = plan_ctx(&engine, &group, &tags);
             let (actions, outcome) = chain.run(&ctx, GuardLayer::Plan).await;
-            assert!(is_blocked(&outcome), "non-http(s) webhook URL must deny at construction");
+            assert!(
+                is_blocked(&outcome),
+                "non-http(s) webhook URL must deny at construction"
+            );
             assert_eq!(actions[0].guard, "http_webhook");
             assert!(actions[0]
                 .reason
