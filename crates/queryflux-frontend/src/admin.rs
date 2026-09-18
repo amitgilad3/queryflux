@@ -2799,7 +2799,10 @@ fn merge_access_control_secrets(incoming: &mut serde_json::Value, previous: &ser
     let Some(prev_conns) = previous.get("connections").and_then(|c| c.as_object()) else {
         return;
     };
-    let Some(conns) = incoming.get_mut("connections").and_then(|c| c.as_object_mut()) else {
+    let Some(conns) = incoming
+        .get_mut("connections")
+        .and_then(|c| c.as_object_mut())
+    else {
         return;
     };
     for (name, conn) in conns.iter_mut() {
@@ -3543,7 +3546,10 @@ mod tests {
             }
         });
         super::merge_access_control_secrets(&mut incoming, &previous);
-        assert_eq!(incoming["connections"]["default"]["opa"]["bearerToken"], "keep-me");
+        assert_eq!(
+            incoming["connections"]["default"]["opa"]["bearerToken"],
+            "keep-me"
+        );
         assert_eq!(
             incoming["connections"]["default"]["opa"]["clientCredentials"]["clientSecret"],
             "keep-secret"
@@ -3554,7 +3560,8 @@ mod tests {
     fn merge_access_control_secrets_leaves_new_connection_alone() {
         // A brand-new connection (not present in `previous`) has nothing to merge from;
         // its blank secret fields must be left as-is rather than panicking.
-        let previous = json!({ "connections": { "default": { "opa": { "bearerToken": "keep-me" } } } });
+        let previous =
+            json!({ "connections": { "default": { "opa": { "bearerToken": "keep-me" } } } });
         let mut incoming = json!({
             "connections": {
                 "default": { "opa": { "bearerToken": "" } },
@@ -3562,7 +3569,10 @@ mod tests {
             }
         });
         super::merge_access_control_secrets(&mut incoming, &previous);
-        assert_eq!(incoming["connections"]["default"]["opa"]["bearerToken"], "keep-me");
+        assert_eq!(
+            incoming["connections"]["default"]["opa"]["bearerToken"],
+            "keep-me"
+        );
         assert_eq!(incoming["connections"]["eu"]["opa"]["bearerToken"], "");
     }
 }

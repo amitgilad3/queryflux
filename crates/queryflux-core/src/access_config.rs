@@ -439,10 +439,8 @@ mod tests {
             default_connection: Some("prod".to_string()),
             ..Default::default()
         };
-        cfg.connections.insert(
-            "prod".to_string(),
-            AccessConnectionConfig::default(),
-        );
+        cfg.connections
+            .insert("prod".to_string(), AccessConnectionConfig::default());
         cfg.connections.insert(
             "eu".to_string(),
             AccessConnectionConfig {
