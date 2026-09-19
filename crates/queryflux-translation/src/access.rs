@@ -380,6 +380,47 @@ def _nested_writes(tree):
     return False
 
 
+_HARMLESS_TABLE_FUNCTIONS = tuple(
+    getattr(exp, n)
+    for n in ("Unnest", "GenerateSeries", "ExplodingGenerateSeries", "Explode", "Values")
+    if hasattr(exp, n)
+)
+_HARMLESS_NAMES = {
+    "unnest", "generate_series", "range", "generate_subscripts", "explode", "json_each",
+    "jsonb_each", "json_array_elements", "jsonb_array_elements", "string_to_table",
+    "regexp_split_to_table", "flatten", "values",
+}
+_PATH_RE = re.compile(r"\.(csv|tsv|parquet|json|jsonl|ndjson|txt|gz|zst|arrow|avro|orc|xlsx)$", re.I)
+
+
+def _table_function(fn):
+    """(name, first string argument) of a table function in FROM that can read external data
+    (`read_csv('f.csv')`, `read_parquet(...)`, Trino's `TABLE(my_fn(...))`); None for
+    set-returning helpers that read nothing (`generate_series`, `unnest`, ...)."""
+    inner = fn
+    if isinstance(fn, exp.Anonymous) and fn.name.upper() == "TABLE":
+        inner = next((a for a in fn.expressions if isinstance(a, exp.Func)), fn)
+    if isinstance(inner, _HARMLESS_TABLE_FUNCTIONS):
+        return None
+    name = (inner.name if isinstance(inner, exp.Anonymous) else inner.sql_name()).lower()
+    if name in _HARMLESS_NAMES:
+        return None
+    candidates = []
+    this = inner.args.get("this")
+    if isinstance(this, exp.Expression):
+        candidates.append(this)
+    candidates.extend(inner.expressions or [])
+    path = next((c.name for c in candidates if isinstance(c, exp.Literal) and c.is_string), None)
+    return (name, path)
+
+
+def _table_kind(t):
+    """A bare quoted path (`FROM 's3://b/x.parquet'`) is a location, not a catalog table."""
+    if not t.catalog and not t.db and ("/" in t.name or "\\" in t.name or _PATH_RE.search(t.name)):
+        return "location"
+    return "table"
+
+
 _NAME = r'(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_@#$][\w$@#]*)'
 _QNAME = _NAME + r"(?:\s*\.\s*" + _NAME + r")*"
 
@@ -538,8 +579,17 @@ def extract_resources(sql, dialect, schema_json):
     # (`INSERT INTO t SELECT ... FROM t`) stays its own entry and is still policy-checked.
     per_table = {}
     order = []
+    functions = {}
     for t in src.find_all(exp.Table):
-        if id(t) in target_ids or not t.name or t.name.startswith("@"):
+        if id(t) in target_ids:
+            continue
+        if not t.name and isinstance(t.this, exp.Func):
+            # `FROM read_csv('f.csv')`: a table function, invisible as a table.
+            fn = _table_function(t.this)
+            if fn is not None:
+                functions[fn] = None
+            continue
+        if not t.name or t.name.startswith("@"):
             continue
         if not t.catalog and not t.db and t.name.lower() in ctes:
             continue
@@ -551,6 +601,7 @@ def extract_resources(sql, dialect, schema_json):
                 "table": t.name,
                 "columns": set(),
                 "all": False,
+                "kind": _table_kind(t),
             }
             order.append(key)
 
@@ -585,7 +636,17 @@ def extract_resources(sql, dialect, schema_json):
             "table": e["table"],
             "columns": None if e["all"] else sorted(e["columns"]),
             "target": False,
-            "kind": "table",
+            "kind": e["kind"],
+        })
+    for name, path in functions:
+        out.append({
+            "catalog": None,
+            "schema": None,
+            "table": name,
+            "columns": None,
+            "target": False,
+            "kind": "function",
+            "value": path,
         })
     # A write target reports what the statement writes, not what its WHERE reads.
     for node, kind in targets:
@@ -621,6 +682,26 @@ def apply_write_filters(sql, dialect, filters_json):
             if not col.table and col.find_ancestor(exp.Select) is None:
                 col.set("table", exp.to_identifier(ref))
         conditions.append(cond)
+    if isinstance(tree, exp.Update):
+        # Scoping controls which rows the UPDATE reaches, not what it writes: assigning a column
+        # the filter depends on could move rows out of the caller's scope.
+        assigned = {
+            e.this.name.lower()
+            for e in tree.expressions
+            if isinstance(e, exp.EQ) and isinstance(e.this, exp.Column)
+        }
+        scoped = {
+            c.name.lower()
+            for cond in conditions
+            for c in cond.find_all(exp.Column)
+            if c.find_ancestor(exp.Select) is None
+        }
+        moved = sorted(assigned & scoped)
+        if moved:
+            raise ValueError(
+                "UPDATE sets %s, which the row-scoping filter depends on: it could move rows "
+                "out of the caller's scope" % ", ".join(moved)
+            )
     return tree.where(*conditions, append=True, copy=False).sql(dialect=dialect or None)
 
 
@@ -1667,6 +1748,104 @@ mod tests {
                 vec![triple("procedure", "proc", None)]
             )
         );
+    }
+
+    /// `(kind, name, value)` of every read in `sql`, sorted.
+    fn reads_of(dialect: SqlDialect, sql: &str) -> Vec<AdminResource> {
+        let st = extract_resources(sql, &dialect, &SchemaContext::default()).unwrap();
+        let mut out: Vec<_> = st
+            .resources
+            .iter()
+            .filter(|r| !r.is_write_target)
+            .map(|r| (r.kind.as_str(), r.table.clone(), r.value.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A table function in `FROM` (`read_csv('f.csv')`) and a bare quoted path are other ways
+    /// to reach the same data as a table, so they are reads of their own kinds — the function
+    /// with its path argument as `value`. Set-returning helpers that read nothing are skipped.
+    #[test]
+    fn extract_resources_table_functions_and_paths_are_their_own_kinds() {
+        use SqlDialect::{DuckDb, Postgres, Trino};
+        let t = |k: &'static str, n: &str, v: Option<&str>| (k, n.to_string(), v.map(String::from));
+        for (dialect, sql, expected) in [
+            (
+                DuckDb,
+                "SELECT * FROM read_csv('f.csv')",
+                vec![t("function", "read_csv", Some("f.csv"))],
+            ),
+            (
+                DuckDb,
+                "SELECT * FROM read_parquet('s3://b/k.parquet') p JOIN customers c ON c.id = p.id",
+                vec![
+                    t("function", "read_parquet", Some("s3://b/k.parquet")),
+                    t("table", "customers", None),
+                ],
+            ),
+            (
+                DuckDb,
+                "SELECT * FROM 'f.csv'",
+                vec![t("location", "f.csv", None)],
+            ),
+            (
+                DuckDb,
+                "SELECT * FROM 's3://bucket/x.parquet'",
+                vec![t("location", "s3://bucket/x.parquet", None)],
+            ),
+            (
+                Trino,
+                "SELECT * FROM TABLE(my_fn(1))",
+                vec![t("function", "my_fn", None)],
+            ),
+            // Nothing to authorize: generators and unnesting read no data.
+            (Postgres, "SELECT * FROM generate_series(1, 3)", vec![]),
+            (DuckDb, "SELECT * FROM range(3)", vec![]),
+            (Postgres, "SELECT * FROM unnest(ARRAY[1, 2])", vec![]),
+            // A dotted table name is still a table.
+            (
+                Postgres,
+                "SELECT * FROM \"my.table\"",
+                vec![t("table", "my.table", None)],
+            ),
+        ] {
+            assert_eq!(reads_of(dialect, sql), expected, "{sql}");
+        }
+    }
+
+    /// The row filter scopes which rows an UPDATE reaches; an UPDATE that assigns a column the
+    /// filter depends on could move rows out of that scope, so it is refused.
+    #[test]
+    fn write_filter_refuses_an_update_that_moves_rows_out_of_scope() {
+        let apply = |sql: &str, filter: &str| {
+            apply_write_filters(sql, &SqlDialect::Trino, &[filter.to_string()])
+        };
+        let err = apply("UPDATE orders SET region = 'US'", "region = 'EU'").unwrap_err();
+        assert!(err.to_string().contains("region"), "{err}");
+        assert!(
+            apply("UPDATE orders SET REGION = 'US'", "region = 'EU'").is_err(),
+            "case-insensitive"
+        );
+        assert!(apply(
+            "UPDATE orders SET amount = 1, region = 'US'",
+            "region = 'EU'"
+        )
+        .is_err());
+        // The filter's own subquery columns don't count; its top-level column does.
+        assert!(apply(
+            "UPDATE orders SET region = 'US'",
+            "region IN (SELECT region FROM allowed)"
+        )
+        .is_err());
+        assert!(apply(
+            "UPDATE orders SET amount = 1",
+            "region IN (SELECT region FROM allowed)"
+        )
+        .is_ok());
+        // Updating other columns, or deleting, is unaffected.
+        assert!(apply("UPDATE orders SET amount = 1", "region = 'EU'").is_ok());
+        assert!(apply("DELETE FROM orders", "region = 'EU'").is_ok());
     }
 
     /// Statements that merely name a table do not read it and must not be treated as reads.

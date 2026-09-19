@@ -64,6 +64,8 @@ impl Operation {
         "procedure.create",
         "procedure.drop",
         "procedure.call",
+        "function.execute",
+        "location.read",
     ];
 
     /// The operation a `CREATE OR REPLACE` also performs: replacing destroys the existing
@@ -109,6 +111,8 @@ pub enum ResourceKind {
     Role,
     Function,
     Procedure,
+    /// A path or URL read directly (`FROM 's3://bucket/x.parquet'`), not a catalog table.
+    Location,
 }
 
 impl ResourceKind {
@@ -122,6 +126,7 @@ impl ResourceKind {
             ResourceKind::Role => "role",
             ResourceKind::Function => "function",
             ResourceKind::Procedure => "procedure",
+            ResourceKind::Location => "location",
         }
     }
 }
@@ -397,6 +402,7 @@ mod tests {
             ResourceKind::Function,
             ResourceKind::Procedure,
             ResourceKind::Session,
+            ResourceKind::Location,
         ] {
             assert_eq!(r(kind, None, Some("s"), "thing").name(), "thing");
         }

@@ -621,7 +621,7 @@ mod tests {
             "table.selct",
             "statement.other",
             "select",
-            "function.execute",
+            "function.call",
             "table.grant",
         ] {
             let err = conn(&[bad]).validate("c").unwrap_err();

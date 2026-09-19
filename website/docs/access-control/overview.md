@@ -137,7 +137,7 @@ accessControl:
         url: http://localhost:8181
         decisionPath: /v1/data/queryflux/access
         timeoutMs: 1000
-      operations: [table.select]        # also: table.insert/update/delete/merge/truncate/create/drop/alter, view.*, schema.*, catalog.*, function.*, procedure.*, grant.*, role.*, session.*
+      operations: [table.select]        # also: table.insert/update/delete/merge/truncate/create/drop/alter, view.*, schema.*, catalog.*, function.*, procedure.*, grant.*, role.*, session.*, location.read
       onMissingSchema: evaluate         # evaluate | deny
       failOpen: false                   # provider error → deny by default
       cacheTtlMs: 5000                  # 0 disables the decision cache
@@ -155,7 +155,7 @@ accessControl:
 | `enabled` | Global default: run access control for a cluster group unless `groups.<name>.enabled` overrides. Default: `true` when `accessControl` is set. Set `false` to opt in only where groups explicitly set `enabled: true`. |
 | `defaultConnection` | Named entry under `connections` that a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all** — there's nothing to route it to. Must reference a key under `connections` when set. |
 | `connections` | Map of named policy-provider connections. No name is reserved — see [Multiple connections](#multiple-connections). |
-| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. One of the [operations listed here](#what-policies-apply-to) (`table.*`, `view.*`, `schema.*`, `catalog.*`, `function.*`, `procedure.*`, `grant.*`, `role.*`, `session.*`) — anything else fails validation. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
+| `connections.<name>.operations` | Namespaced ops the connection evaluates; others skip the stage. One of the [operations listed here](#what-policies-apply-to) (`table.*`, `view.*`, `schema.*`, `catalog.*`, `function.*`, `procedure.*`, `grant.*`, `role.*`, `session.*`, `location.read`) — anything else fails validation. Default: `[table.select]`. See [What policies apply to](#what-policies-apply-to). |
 | `connections.<name>.onMissingSchema` | When columns can't be resolved (`SELECT *` without catalog): `evaluate` still calls the provider with "all columns"; `deny` fails closed. |
 | `connections.<name>.failOpen` | Provider timeout/transport error → allow (`true`) or deny (`false`, default) for groups on this connection. |
 | `connections.<name>.cacheTtlMs` / `cacheCapacity` | TTL cache of identical decisions on this connection; `0` disables. |
@@ -245,6 +245,8 @@ The **write target** is a second, separate provider call, made only when the sta
 | `SET ROLE r`, `USE ROLE r` | `role.set` | `r`, kind `role` | — |
 | `SET x = v`, `RESET x`, `ALTER SESSION SET …`, `USE WAREHOUSE w` | `session.set` | `x`, kind `session`, with its `value` | — |
 | `USE s` / `USE c.s` | `session.use` | the schema (or catalog), kind `schema` / `catalog` | — |
+| `FROM read_csv('f.csv')`, `read_parquet(…)`, `TABLE(fn(…))` | `function.execute` | the function, kind `function`, its first string argument as `value` | — |
+| `FROM 's3://b/x.parquet'` (a bare path) | `location.read` | the path, kind `location` | — |
 
 A `GRANT`/`REVOKE` request also carries `action.grant` — `{"privileges": [...], "grantees": ["alice", "role:bob"], "withGrantOption": true}` — since who receives what is the decision. Role grants carry `grantees` only.
 
@@ -252,11 +254,13 @@ So `UPDATE orders SET amount = 0 WHERE id IN (SELECT id FROM customers)` makes t
 
 **Row scoping on writes.** A row filter returned for an `UPDATE` or `DELETE` target is ANDed into the statement's `WHERE` — the caller's own conditions are kept, parenthesized — so the write can only reach rows the policy allows, like Postgres row-level security. Unqualified columns in the filter are qualified with the target's alias (or table name), so a filter like `region = 'EU'` stays unambiguous when the statement also joins a table with a `region` column (`UPDATE … FROM`, `DELETE … USING`). The write's filter comes from the policy's decision for *that* operation, independent of any `table.select` filter on the same table. Rows outside the scope are silently skipped — the rows-affected count shrinks, no error is raised — and the rewrite is audited like any other (`row_filtered` lists the target).
 
-Two limits. Scoping controls which rows a write may **target**, not what it may write (`USING` without `WITH CHECK`): a caller can `UPDATE … SET region = 'US'` on their own rows and move them out of scope. To prevent that, deny `table.update` for that column — write targets carry the columns they set. And `INSERT`, `MERGE` and `TRUNCATE` have no `WHERE` limiting which rows the write touches, so a row filter returned for one is denied (`ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE`) rather than silently skipped. A column mask returned for any write is denied too: a mask changes what a read returns, and a write returns nothing.
+Two limits. Scoping controls which rows a write may **target**, not what it may write (`USING` without `WITH CHECK`), so an `UPDATE` that assigns a column the filter depends on — `UPDATE … SET region = 'US'` under a `region = 'EU'` filter, which could move rows out of scope — is refused rather than run. Other columns update normally, and an `INSERT` is not checked against the filter. And `INSERT`, `MERGE` and `TRUNCATE` have no `WHERE` limiting which rows the write touches, so a row filter returned for one is denied (`ACCESS_REWRITE_UNSUPPORTED_FOR_WRITE`) rather than silently skipped. A column mask returned for any write is denied too: a mask changes what a read returns, and a write returns nothing.
 
 Writes are **not authorized by default**: with the default `operations: [table.select]` no write target is sent to the provider, so neither allow/deny nor scoping applies to it. `operations` is validated at startup; an entry that isn't a supported operation is rejected, since a typo would silently switch that protection off.
 
 Every resource is sent with its `kind` (`table`, `view`, `schema`, `catalog`) and its `name`; a schema or catalog has no `table`. Reads inside DDL are still `table.select`: `CREATE VIEW v AS SELECT … FROM secret` and `CREATE TABLE t AS SELECT … FROM secret` check `v`/`t` under the create operation **and** `secret` as a read, and denying either stops the statement. `CREATE OR REPLACE` destroys the existing object, so it also makes the matching `*.drop` request. As with any non-`UPDATE`/`DELETE` write, a row filter or column mask returned for a DDL target is denied rather than applied.
+
+**Other routes to the same data.** A table function or a bare path reads a file the way a table reads its rows, so a policy that denies `customers` does not stop `SELECT * FROM read_csv('/lake/customers.csv')` on a backend that can read that file. Enable `function.execute` and `location.read` to evaluate them; the function is sent with its path as `value` so a policy can allow specific functions or locations and deny the rest. They are opt-in like every other non-`table.select` operation. Without `location.read`, a bare path is still evaluated as a `table.select` on the path-named "table", exactly as before. Generators and unnesting (`generate_series`, `range`, `unnest`) read no data and are not evaluated.
 
 **Reads hidden inside other statements are checked too**, whatever `operations` says, because they are still reads of a protected table: `COPY (SELECT …) TO …` and `COPY t TO …` (the export's source tables), and `EXPLAIN [ANALYZE] <statement>`, which is checked — and rewritten — as the statement it wraps (`EXPLAIN ANALYZE` executes it). An `EXPLAIN` whose wrapped statement can't be located is denied rather than guessed at. A data-modifying statement nested in a query (`WITH d AS (DELETE … RETURNING *) SELECT …`) can't be attributed as a write, so it is refused (`ACCESS_UNSUPPORTED_STATEMENT`).
 

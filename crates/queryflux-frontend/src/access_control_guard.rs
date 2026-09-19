@@ -11,7 +11,7 @@ use queryflux_access_control::{
     AccessController, AccessResource, Columns, Identity, Operation, RequestContext,
 };
 use queryflux_core::access_config::OnMissingSchema;
-use queryflux_core::access_model::{AccessDecision, AccessRequest, GrantDetail};
+use queryflux_core::access_model::{AccessDecision, AccessRequest, GrantDetail, ResourceKind};
 use queryflux_core::query::EngineType;
 use queryflux_core::query::{ClusterGroupName, SqlDialect};
 use queryflux_core::schema_context::SchemaContext;
@@ -262,21 +262,59 @@ impl Guard for OpaAccessGuard {
             .resources
             .into_iter()
             .partition(|r| r.is_write_target);
+        // Table functions (`read_csv('f.csv')`) and bare paths (`FROM 's3://b/x.parquet'`) reach
+        // the same data as a table by another route. They are evaluated under their own
+        // operations when enabled; otherwise a bare path stays a table read (as it always
+        // was) and a function is not evaluated.
+        let function_op = Operation("function.execute".to_string());
+        let location_op = Operation("location.read".to_string());
+        let (mut function_reads, mut location_reads, mut table_reads) =
+            (Vec::new(), Vec::new(), Vec::new());
+        for r in reads {
+            match r.kind {
+                ResourceKind::Function => function_reads.push(r),
+                ResourceKind::Location => location_reads.push(r),
+                _ => table_reads.push(r),
+            }
+        }
+        if !conn.controller.evaluates(&function_op) {
+            function_reads.clear();
+        }
+        if !conn.controller.evaluates(&location_op) {
+            table_reads.extend(location_reads.drain(..).map(|r| ExtractedResource {
+                kind: ResourceKind::Table,
+                ..r
+            }));
+        }
         let check_reads =
-            evaluates_reads && !reads.is_empty() && (operation.is_read() || embeds_reads);
+            evaluates_reads && !table_reads.is_empty() && (operation.is_read() || embeds_reads);
         let write_ops: Vec<Operation> = write_operations(&statement_op, statement.replaces)
             .into_iter()
             .filter(|o| conn.controller.evaluates(o))
             .collect();
-        let check_write = !write_ops.is_empty() && !targets.is_empty();
-        if !check_reads && !check_write {
+        // Every non-`table.select` provider call: the write target(s), then external reads.
+        let mut phases: Vec<(Operation, Vec<ExtractedResource>, Option<GrantDetail>)> = Vec::new();
+        if !targets.is_empty() {
+            for op in &write_ops {
+                phases.push((op.clone(), targets.clone(), grant.clone()));
+            }
+        }
+        if !function_reads.is_empty() {
+            phases.push((function_op, function_reads, None));
+        }
+        if !location_reads.is_empty() {
+            phases.push((location_op, location_reads, None));
+        }
+        if !check_reads && phases.is_empty() {
             // No base tables (e.g. `SELECT 1`), or nothing this connection evaluates.
             return GuardResult::allow();
         }
 
         if check_reads
             && conn.on_missing_schema == OnMissingSchema::Deny
-            && reads.iter().any(|r| matches!(r.columns, Columns::All))
+            && table_reads
+                .iter()
+                .any(|r| matches!(r.columns, Columns::All))
         {
             return GuardResult::deny(
                 "access control: table columns could not be resolved (onMissingSchema=deny)",
@@ -332,11 +370,15 @@ impl Guard for OpaAccessGuard {
         // Row filters for the write target: the policy's own decision for the statement's
         // operation, kept apart from any `table.select` filters on the tables it reads.
         let mut write_scope: Option<(String, Vec<String>)> = None;
-        if check_write {
-            for write_op in &write_ops {
+        if !phases.is_empty() {
+            for (write_op, phase_targets, phase_grant) in &phases {
                 let decision = conn
                     .controller
-                    .evaluate(&build_request(write_op.clone(), &targets, grant.clone()))
+                    .evaluate(&build_request(
+                        write_op.clone(),
+                        phase_targets,
+                        phase_grant.clone(),
+                    ))
                     .await;
                 if !decision.is_allowed() {
                     return deny_first(&decision);
@@ -368,7 +410,7 @@ impl Guard for OpaAccessGuard {
                     // rows it touches, so deny rather than silently skip a restriction the
                     // policy meant to apply.
                     if matches!(write_op.as_str(), "table.update" | "table.delete") {
-                        write_scope = Some((targets[0].table.clone(), filters));
+                        write_scope = Some((phase_targets[0].table.clone(), filters));
                     } else {
                         return GuardResult::deny(
                             format!(
@@ -393,7 +435,11 @@ impl Guard for OpaAccessGuard {
         if check_reads {
             let decision = conn
                 .controller
-                .evaluate(&build_request(Operation::table_select(), &reads, None))
+                .evaluate(&build_request(
+                    Operation::table_select(),
+                    &table_reads,
+                    None,
+                ))
                 .await;
 
             if !decision.is_allowed() {

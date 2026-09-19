@@ -220,25 +220,30 @@ async fn column_masks_on_a_write_fail_closed() {
     );
 }
 
-/// Scoping decides which rows a write may *target*, not what it may write (Postgres RLS
-/// `USING` without `WITH CHECK`). A caller can therefore move a row out of their own scope;
-/// a policy that must prevent it should deny `table.update` on the scoping column instead.
-/// This test pins that boundary so it can't change unnoticed.
+/// Scoping decides which rows a write may *target*, not what it may write, so an UPDATE that
+/// assigns a column the filter depends on could move a row out of the caller's scope. It is
+/// refused; updating other columns is unaffected.
 #[tokio::test]
-async fn update_can_move_a_row_out_of_the_callers_scope() {
+async fn update_that_would_move_a_row_out_of_scope_is_refused() {
     let (opa_url, stub) = start_opa_stub().await;
     let h = harness(&opa_url, &["table.select", "table.update"]).await;
     let client = pg_connect(h.postgres_port).await;
     seed_orders(&client).await;
     stub.lock().unwrap().filter("orders", "region = 'EU'");
 
-    pg_run(&client, "UPDATE orders SET region = 'US' WHERE id = 10")
+    let err = pg_run(&client, "UPDATE orders SET region = 'US' WHERE id = 10")
         .await
-        .expect("update");
+        .expect_err("moving a row out of scope");
+    assert!(err.contains("region"), "unexpected error: {err}");
+    assert_eq!(
+        orders(&client, &stub).await,
+        ["10:50", "11:150", "12:200", "13:80"],
+        "nothing may have changed"
+    );
 
-    stub.lock().unwrap().clear_filters();
-    let rows = pg_run(&client, "SELECT region FROM orders WHERE id = 10")
+    // Other columns are still updatable within scope.
+    stub.lock().unwrap().filter("orders", "region = 'EU'");
+    pg_run(&client, "UPDATE orders SET amount = 1 WHERE id = 10")
         .await
-        .unwrap();
-    assert_eq!(rows[0][0], "US", "row 10 left the caller's EU scope");
+        .expect("in-scope update of another column");
 }
