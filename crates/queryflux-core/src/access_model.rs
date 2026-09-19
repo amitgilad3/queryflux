@@ -40,7 +40,24 @@ impl Operation {
         "table.delete",
         "table.merge",
         "table.truncate",
+        "table.create",
+        "table.drop",
+        "table.alter",
+        "view.create",
+        "view.drop",
+        "view.alter",
+        "schema.create",
+        "schema.drop",
+        "catalog.create",
+        "catalog.drop",
     ];
+
+    /// The operation a `CREATE OR REPLACE` also performs: replacing destroys the existing
+    /// object, so it needs the matching `*.drop` too. `None` for anything that isn't a create.
+    pub fn drop_counterpart(&self) -> Option<Self> {
+        let (kind, verb) = self.0.split_once('.')?;
+        (verb == "create").then(|| Self(format!("{kind}.drop")))
+    }
 
     pub fn table_select() -> Self {
         Self("table.select".to_string())
@@ -62,9 +79,35 @@ pub enum Columns {
     Named(Vec<String>),
 }
 
-/// One table (with its referenced columns) a query touches.
+/// What kind of catalog object a resource is. Reads always name tables; DDL can also target
+/// views, schemas and catalogs (`CREATE DATABASE` is reported as a catalog).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceKind {
+    #[default]
+    Table,
+    View,
+    Schema,
+    Catalog,
+}
+
+impl ResourceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResourceKind::Table => "table",
+            ResourceKind::View => "view",
+            ResourceKind::Schema => "schema",
+            ResourceKind::Catalog => "catalog",
+        }
+    }
+}
+
+/// One object (a table with its referenced columns, or — for DDL — a view, schema or catalog)
+/// a statement touches. For `Schema` the object is `catalog`.`schema` and `table` is empty; for
+/// `Catalog` only `catalog` is set.
 #[derive(Debug, Clone)]
 pub struct AccessResource {
+    pub kind: ResourceKind,
     pub catalog: Option<String>,
     pub schema: Option<String>,
     pub table: String,
@@ -72,6 +115,16 @@ pub struct AccessResource {
 }
 
 impl AccessResource {
+    /// The object's own name — the table/view name, the schema name, or the catalog name.
+    /// This is the key a policy's per-resource decision is matched back on.
+    pub fn name(&self) -> &str {
+        match self.kind {
+            ResourceKind::Table | ResourceKind::View => &self.table,
+            ResourceKind::Schema => self.schema.as_deref().unwrap_or_default(),
+            ResourceKind::Catalog => self.catalog.as_deref().unwrap_or_default(),
+        }
+    }
+
     /// `schema.table` (or bare `table`) — the key policy decisions and the rewrite match on.
     pub fn qualified_name(&self) -> String {
         match &self.schema {
@@ -254,6 +307,48 @@ mod tests {
             row_filters: Vec::new(),
             column_masks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn create_operations_have_a_drop_counterpart() {
+        for (create, drop) in [
+            ("table.create", "table.drop"),
+            ("view.create", "view.drop"),
+            ("schema.create", "schema.drop"),
+            ("catalog.create", "catalog.drop"),
+        ] {
+            assert_eq!(
+                Operation(create.to_string()).drop_counterpart(),
+                Some(Operation(drop.to_string()))
+            );
+            assert!(Operation::SUPPORTED.contains(&create) && Operation::SUPPORTED.contains(&drop));
+        }
+        assert_eq!(Operation::table_select().drop_counterpart(), None);
+        assert_eq!(Operation("table.drop".to_string()).drop_counterpart(), None);
+    }
+
+    #[test]
+    fn resource_name_is_the_kinds_own_leaf() {
+        let r = |kind, catalog: Option<&str>, schema: Option<&str>, table: &str| AccessResource {
+            kind,
+            catalog: catalog.map(String::from),
+            schema: schema.map(String::from),
+            table: table.to_string(),
+            columns: Columns::All,
+        };
+        assert_eq!(
+            r(ResourceKind::Table, Some("c"), Some("s"), "orders").name(),
+            "orders"
+        );
+        assert_eq!(r(ResourceKind::View, None, Some("s"), "v").name(), "v");
+        assert_eq!(
+            r(ResourceKind::Schema, Some("c"), Some("analytics"), "").name(),
+            "analytics"
+        );
+        assert_eq!(
+            r(ResourceKind::Catalog, Some("prod"), None, "").name(),
+            "prod"
+        );
     }
 
     #[test]
