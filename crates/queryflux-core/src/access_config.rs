@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::access_model::Operation;
+
 /// What to do when the query's referenced table columns can't be resolved from the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -247,9 +249,11 @@ impl AccessConnectionConfig {
             }
         }
         for op in &self.operations {
-            if !op.contains('.') {
+            if !Operation::SUPPORTED.contains(&op.as_str()) {
                 return Err(format!(
-                    "accessControl.connections.{name}.operations entry {op:?} must be namespaced (e.g. table.select)"
+                    "accessControl.connections.{name}.operations entry {op:?} is not a supported \
+                     operation (supported: {})",
+                    Operation::SUPPORTED.join(", ")
                 ));
             }
         }
@@ -601,6 +605,22 @@ mod tests {
         // No `defaultConnection` set — a group with no explicit override gets nothing.
         assert_eq!(cfg.connection_name_for_group("trino-prod"), None);
         assert!(cfg.connection_for_group("trino-prod").is_none());
+    }
+
+    /// A typo in `operations` would silently disable enforcement for that operation.
+    #[test]
+    fn validate_rejects_unsupported_operations() {
+        let conn = |ops: &[&str]| AccessConnectionConfig {
+            operations: ops.iter().map(|o| o.to_string()).collect(),
+            ..AccessConnectionConfig::default()
+        };
+        for ok in Operation::SUPPORTED {
+            assert!(conn(&[ok]).validate("c").is_ok(), "{ok} should be accepted");
+        }
+        for bad in ["table.selct", "statement.other", "select", "table.create"] {
+            let err = conn(&[bad]).validate("c").unwrap_err();
+            assert!(err.contains(bad) && err.contains("table.select"), "{err}");
+        }
     }
 
     #[test]
