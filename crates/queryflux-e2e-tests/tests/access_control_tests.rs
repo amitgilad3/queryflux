@@ -100,7 +100,7 @@ async fn allowed_table_with_row_filter_only_returns_matching_rows() {
 /// A fixup script that monkey-patches the translated AST from a `Select` into a `Delete`
 /// referencing the same table — simulating a buggy operator-authored translation fixup
 /// script mutating the query after our own scan-site rewrite. Proves the post-rewrite
-/// invariant assert in `dispatch.rs` (Phase 4 step 4a) denies rather than silently letting
+/// statement-kind check in `run_fixup_scripts` rejects it rather than silently letting
 /// a read become a write.
 const SELECT_TO_DELETE_FIXUP: &str = r#"
 import sqlglot
@@ -121,7 +121,7 @@ def transform(sql: str, src: str, dst: str) -> str:
 "#;
 
 #[tokio::test]
-async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
+async fn fixup_script_turning_read_into_write_is_rejected() {
     let (opa_url, stub) = start_opa_stub().await;
     // Any row filter forces the access-control guard down the `Rewrite` path, which is
     // what arms the post-translation invariant assert (see `dispatch.rs`).
@@ -142,9 +142,15 @@ async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
 
     let err = pg_run(&client, "SELECT id FROM orders")
         .await
-        .expect_err("a fixup script turning the read into a write must be denied");
-    assert!(!err.is_empty());
+        .expect_err("a fixup script turning the read into a write must be rejected");
+    assert!(
+        err.contains("changed the statement kind"),
+        "unexpected error: {err}"
+    );
 
+    // `run_fixup_scripts` rejects any statement-kind change itself, as a translation error —
+    // so the query is recorded as failed rather than guard-denied. What matters is that the
+    // rewritten write never reaches the engine.
     let record = h
         .wait_for_record(|r| {
             r.sql_preview
@@ -152,16 +158,15 @@ async fn fixup_script_turning_read_into_write_is_denied_by_invariant_assert() {
                 .contains("select id from orders")
         })
         .await
-        .expect("denied query should be recorded");
-    assert_eq!(format!("{:?}", record.status), "Denied");
-    assert!(record.was_guard_blocked);
+        .expect("rejected query should be recorded");
+    assert_eq!(format!("{:?}", record.status), "Failed");
     assert!(
         record
             .error_message
             .as_deref()
             .unwrap_or_default()
-            .contains("invariant"),
-        "expected an invariant-assert denial reason, got: {:?}",
+            .contains("changed the statement kind from read to non-read"),
+        "expected the statement-kind rejection, got: {:?}",
         record.error_message
     );
 }
