@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use queryflux_core::access_model::{
-    AccessDecision, AccessRequest, ColumnMask, Columns, ResourceDecision, RowFilter,
+    AccessDecision, AccessRequest, ColumnMask, Columns, ResourceDecision, ResourceKind, RowFilter,
 };
 
 // ---- request ----
@@ -79,10 +79,25 @@ pub(super) struct ResourceAttr<'a> {
     pub catalog: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<&'a str>,
-    /// Empty for `schema`/`catalog` resources.
+    /// Only `table` and `view` resources have one; empty otherwise (use `id`).
+    #[serde(skip_serializing_if = "str::is_empty")]
     pub table: &'a str,
+    /// The value a `SET` assigns to a session setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<&'a str>,
+    /// What a `GRANT`/`REVOKE` hands out — only for `grant.*` and `role.grant/revoke`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant: Option<GrantAttr<'a>>,
     /// `null` = all columns (schema unresolved / `SELECT *`).
     pub columns: Option<&'a [String]>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct GrantAttr<'a> {
+    pub privileges: &'a [String],
+    pub grantees: &'a [String],
+    pub with_grant_option: bool,
 }
 
 pub(super) fn to_request<'a>(
@@ -110,7 +125,17 @@ pub(super) fn to_request<'a>(
                     attr: ResourceAttr {
                         catalog: r.catalog.as_deref(),
                         schema: r.schema.as_deref(),
-                        table: &r.table,
+                        table: if matches!(r.kind, ResourceKind::Table | ResourceKind::View) {
+                            &r.table
+                        } else {
+                            ""
+                        },
+                        value: r.value.as_deref(),
+                        grant: req.grant.as_ref().map(|g| GrantAttr {
+                            privileges: &g.privileges,
+                            grantees: &g.grantees,
+                            with_grant_option: g.with_grant_option,
+                        }),
                         columns: match &r.columns {
                             Columns::All => None,
                             Columns::Named(c) => Some(c.as_slice()),
@@ -252,12 +277,14 @@ mod tests {
 
     fn requested(tables: &[&str]) -> AccessRequest {
         AccessRequest {
+            grant: None,
             identity: Identity::default(),
             operation: Operation::table_select(),
             resources: tables
                 .iter()
                 .map(|t| AccessResource {
                     kind: ResourceKind::Table,
+                    value: None,
                     catalog: None,
                     schema: None,
                     table: t.to_string(),
@@ -512,6 +539,7 @@ mod tests {
         req.operation = Operation("schema.drop".to_string());
         req.resources = vec![AccessResource {
             kind: ResourceKind::Schema,
+            value: None,
             catalog: Some("prod".to_string()),
             schema: Some("analytics".to_string()),
             table: String::new(),
@@ -522,6 +550,38 @@ mod tests {
         assert_eq!((r.resource.kind, r.resource.id), ("schema", "analytics"));
         assert_eq!(r.resource.attr.catalog, Some("prod"));
         assert_eq!(r.actions, ["schema.drop"]);
+    }
+
+    #[test]
+    fn to_request_sends_grant_detail_and_session_value_as_attributes() {
+        use queryflux_core::access_model::GrantDetail;
+        let mut req = requested(&["ignored"]);
+        req.operation = Operation("grant.revoke".to_string());
+        req.grant = Some(GrantDetail {
+            privileges: vec!["INSERT".to_string()],
+            grantees: vec!["bob".to_string()],
+            with_grant_option: false,
+        });
+        req.resources = vec![AccessResource {
+            kind: ResourceKind::Session,
+            catalog: None,
+            schema: None,
+            table: "search_path".to_string(),
+            columns: Columns::All,
+            value: Some("analytics".to_string()),
+        }];
+        let json = serde_json::to_value(to_request("req-1", &req)).unwrap();
+        let r = &json["resources"][0]["resource"];
+        assert_eq!(
+            (r["kind"].as_str(), r["id"].as_str()),
+            (Some("session"), Some("search_path"))
+        );
+        assert_eq!(r["attr"]["value"], "analytics");
+        assert_eq!(
+            r["attr"]["grant"]["privileges"],
+            serde_json::json!(["INSERT"])
+        );
+        assert!(r["attr"].get("table").is_none(), "{r}");
     }
 
     #[test]
