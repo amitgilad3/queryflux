@@ -149,6 +149,34 @@ pub fn rewrite_table_scans(
     Python::attach(|py| rewrite_table_scans_gil(py, sql, &dialect, &schema_json, &policies_json))
 }
 
+/// Scope an `UPDATE`/`DELETE` to the rows a policy allows: `filters` are AND-combined into
+/// the statement's `WHERE` (existing conditions are kept, parenthesized). Unqualified columns
+/// in a filter are qualified with the target's alias/name so they stay unambiguous when the
+/// statement also joins other tables (`UPDATE … FROM`, `DELETE … USING`). Output is still
+/// source-dialect SQL.
+///
+/// Only `UPDATE` and `DELETE` can be scoped this way — any other statement is `Err`, so a
+/// caller can't mistake "nothing was applied" for success.
+pub fn apply_write_filters(
+    sql: &str,
+    src_dialect: &SqlDialect,
+    filters: &[String],
+) -> Result<String> {
+    if filters.is_empty() {
+        return Ok(sql.to_string());
+    }
+    let dialect = dialect_kwarg(src_dialect);
+    let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_string());
+    Python::attach(|py| {
+        let module = load_module(py)?;
+        module
+            .getattr("apply_write_filters")
+            .and_then(|f| f.call1((sql, dialect, filters_json)))
+            .and_then(|v| v.extract::<String>())
+            .map_err(|e| QueryFluxError::Translation(format!("apply_write_filters: {e}")))
+    })
+}
+
 fn schema_to_json(schema: &SchemaContext) -> String {
     // { "table_name": { "col1": "type1", ... } } — sqlglot's `qualify(schema=...)`
     // requires this nesting (a dict of column -> type per table); handing it a
@@ -330,6 +358,30 @@ def extract_resources(sql, dialect, schema_json):
             "target": e["target"],
         })
     return json.dumps({"resources": out, "embeds_reads": embeds_reads})
+
+
+def apply_write_filters(sql, dialect, filters_json):
+    filters = json.loads(filters_json)
+    tree = sqlglot.parse_one(sql, dialect=dialect or None)
+    if not isinstance(tree, (exp.Update, exp.Delete)):
+        raise ValueError(
+            "row filters can only scope UPDATE and DELETE, got %s" % type(tree).__name__
+        )
+    targets, _ = _write_targets(tree)
+    if len(targets) != 1:
+        raise ValueError("cannot identify the statement's write target")
+    ref = targets[0].alias or targets[0].name
+
+    conditions = []
+    for f in filters:
+        cond = sqlglot.parse_one(f, dialect=dialect or None)
+        # Qualify the filter's own columns with the target so they can't become ambiguous
+        # against a joined table. Columns inside a subquery belong to that subquery.
+        for col in list(cond.find_all(exp.Column)):
+            if not col.table and col.find_ancestor(exp.Select) is None:
+                col.set("table", exp.to_identifier(ref))
+        conditions.append(cond)
+    return tree.where(*conditions, append=True, copy=False).sql(dialect=dialect or None)
 
 
 def rewrite_table_scans(sql, dialect, schema_json, policies_json):
@@ -792,6 +844,93 @@ mod tests {
         );
         let (reads, _, embeds) = split_statement(sql);
         assert!(reads.is_empty() && !embeds, "{reads:?} {embeds}");
+    }
+
+    fn scope_in(dialect: SqlDialect, sql: &str, filters: &[&str]) -> String {
+        let filters: Vec<String> = filters.iter().map(|f| f.to_string()).collect();
+        apply_write_filters(sql, &dialect, &filters)
+            .unwrap()
+            .to_lowercase()
+    }
+
+    fn scope(sql: &str, filters: &[&str]) -> String {
+        scope_in(SqlDialect::Trino, sql, filters)
+    }
+
+    #[test]
+    fn write_filter_becomes_the_where_of_an_update_or_delete() {
+        assert_eq!(
+            scope("UPDATE orders SET amount = 1", &["region = 'EU'"]),
+            "update orders set amount = 1 where orders.region = 'eu'"
+        );
+        assert_eq!(
+            scope("DELETE FROM orders", &["region = 'EU'"]),
+            "delete from orders where orders.region = 'eu'"
+        );
+    }
+
+    /// The policy filter must constrain the whole existing predicate, not just its last term.
+    #[test]
+    fn write_filter_parenthesizes_the_existing_where() {
+        let out = scope(
+            "DELETE FROM orders WHERE id = 1 OR id = 2",
+            &["region = 'EU'", "amount > 5"],
+        );
+        assert_eq!(
+            out,
+            "delete from orders where (id = 1 or id = 2) and orders.region = 'eu' and orders.amount > 5"
+        );
+    }
+
+    #[test]
+    fn write_filter_qualifies_with_the_target_alias_or_bare_name() {
+        assert!(scope("UPDATE orders o SET amount = 1", &["region = 'EU'"]).contains("o.region"));
+        // A schema-qualified target is referenced by its bare name.
+        assert!(scope("DELETE FROM sales.orders", &["region = 'EU'"]).contains("orders.region"));
+    }
+
+    /// Columns inside a filter's own subquery belong to that subquery and stay untouched.
+    #[test]
+    fn write_filter_leaves_subquery_columns_alone() {
+        let out = scope(
+            "DELETE FROM orders",
+            &["region IN (SELECT region FROM allowed WHERE uid = 7)"],
+        );
+        assert!(
+            out.contains("orders.region in (select region from allowed where uid = 7)"),
+            "{out}"
+        );
+    }
+
+    /// A joined table with a same-named column must not make the filter ambiguous.
+    #[test]
+    fn write_filter_is_qualified_against_a_using_join() {
+        let out = scope_in(
+            SqlDialect::Postgres,
+            "DELETE FROM orders USING customers c WHERE orders.customer_id = c.id",
+            &["region = 'EU'"],
+        );
+        assert!(out.contains("orders.region = 'eu'"), "{out}");
+    }
+
+    #[test]
+    fn write_filters_only_scope_update_and_delete() {
+        let f = vec!["x = 1".to_string()];
+        for sql in [
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (1)",
+            "TRUNCATE TABLE t",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+        ] {
+            assert!(
+                apply_write_filters(sql, &SqlDialect::Trino, &f).is_err(),
+                "{sql} must not be silently left unscoped"
+            );
+        }
+        assert_eq!(
+            apply_write_filters("DELETE FROM t", &SqlDialect::Trino, &[]).unwrap(),
+            "DELETE FROM t"
+        );
     }
 
     /// Statements that merely name a table do not read it and must not be treated as reads.
