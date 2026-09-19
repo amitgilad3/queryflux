@@ -325,6 +325,7 @@ mod tests {
 
     fn base_request() -> AccessRequest {
         AccessRequest {
+            grant: None,
             identity: Identity {
                 user: "alice".to_string(),
                 groups: vec![],
@@ -338,6 +339,7 @@ mod tests {
                 schema: None,
                 table: "orders".to_string(),
                 columns: Columns::All,
+                value: None,
             }],
             context: RequestContext {
                 cluster_group: "default".to_string(),
@@ -398,6 +400,7 @@ mod tests {
             schema: Some("s|t".to_string()),
             table: "u".to_string(),
             columns: Columns::All,
+            value: None,
         }];
         ctl.evaluate(&a).await;
 
@@ -408,6 +411,7 @@ mod tests {
             schema: Some("s".to_string()),
             table: "t|u".to_string(),
             columns: Columns::All,
+            value: None,
         }];
         ctl.evaluate(&b).await;
 
