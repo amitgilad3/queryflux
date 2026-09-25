@@ -300,7 +300,7 @@ impl Guard for OpaAccessGuard {
             return GuardResult::deny(
                 format!(
                     "access control: could not identify the target of {}",
-                    operation.as_str()
+                    statement_op.as_str()
                 ),
                 "ACCESS_ANALYSIS_FAILED",
             );
@@ -643,14 +643,21 @@ fn word_at(s: &str) -> &str {
 
 /// Locate the statement inside `EXPLAIN [ANALYZE|VERBOSE|PLAN FOR|(options)…] <statement>`.
 fn explain_split(sql: &str) -> ExplainSplit {
-    let start = sql.len() - sql.trim_start().len();
-    let head = word_at(&sql[start..]);
+    // Not just whitespace: a leading `/* ... */` or `-- ...` comment before `EXPLAIN` must not
+    // defeat detection — `word_at` on an untrimmed comment returns "" (its first byte, `/` or
+    // `-`, isn't alphanumeric), which `NotExplain`s the whole statement. The wrapped statement
+    // then never gets classified as anything the guard checks, and — since `ANALYZE` runs
+    // it — executes unauthorized.
+    let first = queryflux_core::sql_classify::strip_leading_sql_comments(sql);
+    let start = sql.len() - first.len();
+    let head = word_at(first);
     if !head.eq_ignore_ascii_case("explain") {
         return ExplainSplit::NotExplain;
     }
     let mut pos = start + head.len();
     loop {
-        pos += sql[pos..].len() - sql[pos..].trim_start().len();
+        let rest = queryflux_core::sql_classify::strip_leading_sql_comments(&sql[pos..]);
+        pos = sql.len() - rest.len();
         let rest = &sql[pos..];
         if let Some(open) = rest.strip_prefix('(') {
             let first = word_at(open.trim_start()).to_ascii_lowercase();
@@ -822,6 +829,26 @@ mod tests {
             explain_split("EXPLAIN (ANALYZE SELECT 1"),
             ExplainSplit::Unrecognized
         );
+    }
+
+    /// Regression: a `--` or `/* */` comment before `EXPLAIN` (or before the wrapped
+    /// statement) must not defeat detection — `EXPLAIN`'s own leading-whitespace trim
+    /// doesn't strip comments, so a commented `EXPLAIN ANALYZE DELETE ...` used to fall
+    /// through as `NotExplain` and skip authorization for the statement it wraps and runs.
+    #[test]
+    fn explain_split_skips_leading_comments() {
+        let inner = |sql: &str| match explain_split(sql) {
+            ExplainSplit::Inner(at) => Some(sql[at..].to_string()),
+            _ => None,
+        };
+        for (sql, expected) in [
+            ("-- who reads this\nEXPLAIN SELECT 1", "SELECT 1"),
+            ("/* block */ EXPLAIN ANALYZE DELETE FROM t", "DELETE FROM t"),
+            ("EXPLAIN /* inline */ ANALYZE SELECT 1", "SELECT 1"),
+            ("EXPLAIN -- trailing\nSELECT 1", "SELECT 1"),
+        ] {
+            assert_eq!(inner(sql).as_deref(), Some(expected), "{sql}");
+        }
     }
 
     #[test]

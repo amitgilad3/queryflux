@@ -429,12 +429,18 @@ def _admin(operation, resources, grant=None):
 
 
 def _grant_statement(tree):
+    op = "grant.grant" if isinstance(tree, exp.Grant) else "grant.revoke"
     kinds = {"TABLE": "table", "VIEW": "view", "SCHEMA": "schema", "DATABASE": "catalog",
              "FUNCTION": "function", "PROCEDURE": "procedure"}
     kind = kinds.get(str(tree.args.get("kind") or "TABLE").upper())
     node = _unwrap(tree.args.get("securable"))
     if kind is None or node is None:
-        return None
+        # An unmodelled securable (e.g. GRANT ... ON SEQUENCE, ON ALL TABLES IN SCHEMA):
+        # still report the operation with no resources rather than nothing at all, so the
+        # caller's own "an enabled write operation with no identified target" check denies
+        # it — silently returning None here would let the whole statement fall through
+        # unclassified and unauthorized instead.
+        return _admin(op, [])
     privileges, columns = set(), set()
     for p in tree.args.get("privileges") or []:
         privileges.add(str(p.name).upper())
@@ -444,7 +450,7 @@ def _grant_statement(tree):
         k = pr.args.get("kind")
         grantees.append("%s:%s" % (str(k).lower(), pr.name) if k else pr.name)
     return _admin(
-        "grant.grant" if isinstance(tree, exp.Grant) else "grant.revoke",
+        op,
         [_target_entry(node, kind, sorted(columns) or None)],
         {
             "privileges": sorted(privileges),
@@ -498,6 +504,15 @@ def _command_statement(sql):
     m = re.match(r"(?is)call\s+(%s)\s*\(" % _QNAME, s)
     if m:
         return _admin("procedure.call", [_entry("procedure", _parts(m.group(1)))])
+    # A GRANT/REVOKE form sqlglot couldn't parse into a Grant/Revoke node at all (e.g.
+    # `... ON ALL TABLES IN SCHEMA ...`, `REVOKE ADMIN OPTION FOR ...`) and none of the
+    # role-specific patterns above matched either: still report the operation with no
+    # resources, the same reasoning as _grant_statement's own unmodelled-securable case —
+    # an enabled grant.grant/grant.revoke with no identified target denies instead of this
+    # statement going completely unclassified and unauthorized.
+    m = re.match(r"(?is)(grant|revoke)\b", s)
+    if m:
+        return _admin("grant.grant" if m.group(1).lower() == "grant" else "grant.revoke", [])
     return None
 
 
@@ -1738,6 +1753,36 @@ mod tests {
                 .as_deref(),
             Some("grant.revoke")
         );
+    }
+
+    /// Regression: a GRANT/REVOKE whose securable this doesn't model (`ON SEQUENCE`, `ON ALL
+    /// TABLES IN SCHEMA`, `ADMIN OPTION FOR`, ...) must still report `grant.grant`/
+    /// `grant.revoke` with an empty resource list — not `None` — so the guard's own
+    /// "an enabled write operation with no identified target" check denies it. Returning
+    /// `None` would let the whole statement fall through unclassified, and unauthorized.
+    #[test]
+    fn extract_resources_unmodelled_grant_reports_the_operation_with_no_resources() {
+        for (dialect, sql, op) in [
+            (
+                SqlDialect::Postgres,
+                "GRANT USAGE ON SEQUENCE q TO a",
+                "grant.grant",
+            ),
+            (
+                SqlDialect::Postgres,
+                "GRANT SELECT ON ALL TABLES IN SCHEMA s TO alice",
+                "grant.grant",
+            ),
+            (
+                SqlDialect::Postgres,
+                "REVOKE ADMIN OPTION FOR r FROM u",
+                "grant.revoke",
+            ),
+        ] {
+            let (write_operation, resources) = admin(dialect, sql);
+            assert_eq!(write_operation.as_deref(), Some(op), "{sql}");
+            assert!(resources.is_empty(), "{sql}: {resources:?}");
+        }
     }
 
     #[test]
