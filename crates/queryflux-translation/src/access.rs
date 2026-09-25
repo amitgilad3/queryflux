@@ -505,7 +505,13 @@ def _command_statement(sql):
     m = re.match(r"(?is)set\s+(?:(?:session|local)\s+)?role\s+(%s)" % _NAME, s)
     if m:
         return _admin("role.set", [_entry("role", _parts(m.group(1)))])
-    m = re.match(r"(?is)reset\s+(%s)" % _NAME, s)
+    # `RESET ALL` resets every session setting, not one named "ALL" — modelling it as
+    # session.set on a resource literally called "ALL" would let a policy that denies
+    # session.set on a specific setting (e.g. search_path) be bypassed by resetting
+    # everything at once under a name no real policy would think to guard. Left
+    # unrecognized (like any other statement this function doesn't model) rather than
+    # authorized under a name that doesn't actually describe what it does.
+    m = re.match(r"(?is)reset\s+(?!all\b)(%s)" % _NAME, s)
     if m:
         return _admin("session.set", [_entry("session", _parts(m.group(1)))])
     m = re.match(r"(?is)set\s+(?:(?:session|local|global)\s+)?(%s)\s*(?:=|\s+to\s+)\s*(.+)$" % _NAME, s)
@@ -1867,6 +1873,10 @@ mod tests {
                 vec![triple("session", "search_path", None)]
             )
         );
+        // `RESET ALL` resets every setting, not one named "ALL" — must not be authorized
+        // as session.set on a resource a policy denying a specific setting would never
+        // match, which would let it bypass that denial by resetting everything at once.
+        assert_eq!(admin(Postgres, "RESET ALL"), (None, vec![]));
         assert_eq!(
             admin(Snowflake, "ALTER SESSION SET x = 1"),
             (
