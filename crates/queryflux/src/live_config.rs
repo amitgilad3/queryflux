@@ -218,215 +218,400 @@ pub(crate) fn validate_live_config_refs(
     issues
 }
 
-/// Per expanded variant: merged JSON config, optional max concurrency, optional probe SQL.
-pub(crate) type ExpandedVariantConfig = (
-    serde_json::Value,
-    Option<u64>,
-    Option<String>,
-    Option<String>,
-);
+/// Where a cluster definition came from.
+///
+/// `Persisted` is the engine-specific JSON stored in Postgres (and, later, carried by the
+/// worker config snapshot). `Yaml` keeps the typed `ClusterConfig` from the YAML file,
+/// because converting it to JSON is lossy: `UpsertClusterConfig::from_core` drops
+/// key-pair private keys, `driver` and `maxWaitSecs`. YAML clusters therefore build their
+/// adapter from `ClusterConfig` exactly as before and are not variant-expanded.
+#[derive(Clone)]
+pub(crate) enum ClusterSource {
+    Persisted {
+        engine_key: String,
+        max_running_queries: Option<i64>,
+        config: serde_json::Value,
+        variants: serde_json::Value,
+    },
+    Yaml(Box<queryflux_core::config::ClusterConfig>),
+}
 
-/// Build a `LiveConfig` from DB cluster records, group maps, and router chain components.
+/// One cluster definition, in the plain form every config source produces.
+#[derive(Clone)]
+pub(crate) struct ClusterSpec {
+    pub(crate) name: String,
+    pub(crate) enabled: bool,
+    pub(crate) source: ClusterSource,
+}
+
+impl ClusterSpec {
+    pub(crate) fn from_record(
+        r: &queryflux_persistence::cluster_config::ClusterConfigRecord,
+    ) -> Self {
+        Self {
+            name: r.name.clone(),
+            enabled: r.enabled,
+            source: ClusterSource::Persisted {
+                engine_key: r.engine_key.clone(),
+                max_running_queries: r.max_running_queries,
+                config: r.config.clone(),
+                variants: r.variants.clone(),
+            },
+        }
+    }
+
+    pub(crate) fn from_yaml(name: &str, cfg: &queryflux_core::config::ClusterConfig) -> Self {
+        Self {
+            name: name.to_string(),
+            enabled: cfg.enabled,
+            source: ClusterSource::Yaml(Box::new(cfg.clone())),
+        }
+    }
+}
+
+/// Everything `compile_live_config` needs, as plain values: no database handles and no
+/// persistence record types. YAML startup, Postgres startup and Postgres reload all
+/// produce this; the worker config snapshot will too.
+#[derive(Clone, Default)]
+pub(crate) struct LiveConfigInputs {
+    pub(crate) clusters: Vec<ClusterSpec>,
+    pub(crate) groups: HashMap<String, queryflux_core::config::ClusterGroupConfig>,
+    pub(crate) routers: Vec<queryflux_core::config::RouterConfig>,
+    pub(crate) routing_fallback: String,
+    pub(crate) group_translation_scripts: HashMap<String, Vec<String>>,
+}
+
+impl LiveConfigInputs {
+    /// Inputs from Postgres rows. Group rows that fail to convert reject the whole load.
+    pub(crate) fn from_records(
+        clusters: &[queryflux_persistence::cluster_config::ClusterConfigRecord],
+        groups: HashMap<String, queryflux_core::config::ClusterGroupConfig>,
+        routers: Vec<queryflux_core::config::RouterConfig>,
+        routing_fallback: String,
+        group_translation_scripts: HashMap<String, Vec<String>>,
+    ) -> Self {
+        Self {
+            clusters: clusters.iter().map(ClusterSpec::from_record).collect(),
+            groups,
+            routers,
+            routing_fallback,
+            group_translation_scripts,
+        }
+    }
+}
+
+/// Postgres row ids, used only for `query_history` foreign keys on `ClusterState`.
+/// Empty for YAML-only startup (and for workers).
+#[derive(Clone, Default)]
+pub(crate) struct ConfigIds {
+    pub(crate) clusters: HashMap<String, i64>,
+    pub(crate) groups: HashMap<String, i64>,
+}
+
+impl ConfigIds {
+    pub(crate) fn from_records(
+        clusters: &[queryflux_persistence::cluster_config::ClusterConfigRecord],
+        groups: &[queryflux_persistence::cluster_config::ClusterGroupConfigRecord],
+    ) -> Self {
+        Self {
+            clusters: clusters.iter().map(|r| (r.name.clone(), r.id)).collect(),
+            groups: groups.iter().map(|r| (r.name.clone(), r.id)).collect(),
+        }
+    }
+}
+
+/// How `compile_live_config` treats a part that fails to build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompileMode {
+    /// Startup: an unknown group member, a strategy that fails to build or an unreadable
+    /// routing script rejects the whole config.
+    Strict,
+    /// Hot reload: log and degrade (skip the member, keep the group's previous strategy,
+    /// skip the router) so one bad row doesn't block every other change.
+    Lenient,
+}
+
+/// How to build one runtime cluster's adapter.
+enum AdapterRecipe {
+    Json {
+        engine_key: String,
+        config: serde_json::Value,
+    },
+    Yaml(Box<queryflux_core::config::ClusterConfig>),
+}
+
+/// One runtime cluster: a spec, or one expanded variant of a persisted spec.
+struct RuntimeCluster {
+    name: String,
+    /// The spec it came from (differs from `name` for variants).
+    parent: String,
+    enabled: bool,
+    /// `None` when the engine key does not parse; the cluster then gets no adapter.
+    engine_type: Option<EngineType>,
+    endpoint: Option<String>,
+    /// Cluster-level concurrency override; falls back to the group's limit.
+    max_running_queries: Option<u64>,
+    /// Adapter cache key: rebuild when this changes.
+    fingerprint: String,
+    recipe: AdapterRecipe,
+    /// `None` when the engine key does not parse (excluded from `cluster_configs`).
+    cluster_config: Option<queryflux_core::config::ClusterConfig>,
+}
+
+/// Expand specs into runtime clusters (variants become their own clusters).
+fn runtime_clusters(specs: &[ClusterSpec]) -> Result<Vec<RuntimeCluster>> {
+    use queryflux_core::config::apply_default_probe_queries;
+    use queryflux_core::engine_registry::{
+        cluster_config_from_persisted_json, json_str, parse_auth_from_config_json,
+        parse_engine_key, parse_query_auth_from_config_json,
+    };
+
+    let mut out = Vec::new();
+    for spec in specs {
+        match &spec.source {
+            ClusterSource::Yaml(cfg) => {
+                let engine_key = cfg
+                    .engine
+                    .as_ref()
+                    .map(queryflux_core::engine_registry::engine_key)
+                    .unwrap_or("");
+                out.push(RuntimeCluster {
+                    name: spec.name.clone(),
+                    parent: spec.name.clone(),
+                    enabled: spec.enabled,
+                    engine_type: cfg.engine.as_ref().map(EngineType::from),
+                    endpoint: cfg.endpoint.clone(),
+                    max_running_queries: cfg.max_running_queries,
+                    fingerprint: serde_json::to_string(&(engine_key, cfg.as_ref()))
+                        .unwrap_or_default(),
+                    recipe: AdapterRecipe::Yaml(cfg.clone()),
+                    cluster_config: Some(cfg.as_ref().clone()),
+                });
+            }
+            ClusterSource::Persisted {
+                engine_key,
+                max_running_queries,
+                config,
+                variants,
+            } => {
+                let max_running =
+                    max_running_queries_u64_from_db(&spec.name, *max_running_queries)?;
+                let engine = match parse_engine_key(engine_key) {
+                    Ok(e) => Some(e),
+                    Err(err) => {
+                        tracing::warn!(cluster = %spec.name, "skipping cluster: {err}");
+                        None
+                    }
+                };
+                // Only parsed when the engine key is valid, as before.
+                let base_cfg = match &engine {
+                    Some(engine) => {
+                        let query_auth =
+                            parse_query_auth_from_config_json(config).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "cluster '{}': invalid queryAuth in JSONB: {e}",
+                                    spec.name
+                                )
+                            })?;
+                        let auth = match parse_auth_from_config_json(config) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(
+                                    cluster = %spec.name,
+                                    "invalid auth in cluster config JSON: {e}"
+                                );
+                                None
+                            }
+                        };
+                        Some(cluster_config_from_persisted_json(
+                            engine.clone(),
+                            spec.enabled,
+                            max_running,
+                            config,
+                            auth,
+                            query_auth,
+                        ))
+                    }
+                    None => None,
+                };
+                let engine_type = engine.as_ref().map(EngineType::from);
+
+                let parsed_variants = parse_cluster_variants(variants);
+                if parsed_variants.is_empty() {
+                    let cluster_config = base_cfg.map(|mut c| {
+                        apply_default_probe_queries(&mut c, engine_key, config);
+                        c
+                    });
+                    out.push(RuntimeCluster {
+                        name: spec.name.clone(),
+                        parent: spec.name.clone(),
+                        enabled: spec.enabled,
+                        engine_type,
+                        endpoint: json_str(config, "endpoint"),
+                        max_running_queries: max_running,
+                        fingerprint: serde_json::to_string(&(engine_key.as_str(), config))
+                            .unwrap_or_default(),
+                        recipe: AdapterRecipe::Json {
+                            engine_key: engine_key.clone(),
+                            config: config.clone(),
+                        },
+                        cluster_config,
+                    });
+                    continue;
+                }
+
+                let (health_check_query, reconcile_query) = extract_base_probe_queries(config);
+                let expanded = match queryflux_core::config::expand_cluster_variants(
+                    &spec.name,
+                    config,
+                    engine_key,
+                    &parsed_variants,
+                    health_check_query.as_deref(),
+                    reconcile_query.as_deref(),
+                ) {
+                    Ok(expanded) => expanded,
+                    Err(err) => {
+                        tracing::error!(cluster = %spec.name, error = %err, "variant expansion failed — cluster omitted");
+                        continue;
+                    }
+                };
+                for exp in expanded {
+                    let cluster_config = base_cfg.as_ref().map(|base| {
+                        let mut c = base.clone();
+                        c.max_running_queries = exp.max_running_queries.or(max_running);
+                        c.health_check_query = exp.health_check_query.clone();
+                        c.reconcile_query = exp.reconcile_query.clone();
+                        c
+                    });
+                    out.push(RuntimeCluster {
+                        name: exp.expanded_name.clone(),
+                        parent: spec.name.clone(),
+                        enabled: spec.enabled,
+                        engine_type: engine_type.clone(),
+                        endpoint: json_str(&exp.merged_config, "endpoint"),
+                        max_running_queries: exp.max_running_queries.or(max_running),
+                        fingerprint: serde_json::to_string(&(
+                            engine_key.as_str(),
+                            &exp.merged_config,
+                        ))
+                        .unwrap_or_default(),
+                        recipe: AdapterRecipe::Json {
+                            engine_key: engine_key.clone(),
+                            config: exp.merged_config,
+                        },
+                        cluster_config,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The `ClusterConfig` per runtime cluster, as `LiveConfig::cluster_configs` exposes them
+/// (credential resolution, validation and startup warnings read these).
+pub(crate) fn cluster_configs_from_specs(
+    specs: &[ClusterSpec],
+) -> Result<HashMap<String, queryflux_core::config::ClusterConfig>> {
+    Ok(runtime_clusters(specs)?
+        .into_iter()
+        .filter_map(|rc| rc.cluster_config.map(|c| (rc.name, c)))
+        .collect())
+}
+
+async fn build_adapter(
+    name: &str,
+    recipe: &AdapterRecipe,
+) -> Result<queryflux_engine_adapters::AdapterKind> {
+    let cluster_name = ClusterName(name.to_string());
+    let placeholder_group = ClusterGroupName("_".to_string());
+    match recipe {
+        AdapterRecipe::Json { engine_key, config } => {
+            registered_engines::build_adapter_from_record(
+                cluster_name,
+                placeholder_group,
+                engine_key,
+                config,
+            )
+            .await
+        }
+        AdapterRecipe::Yaml(cfg) => {
+            registered_engines::build_adapter(cluster_name, placeholder_group, cfg, name).await
+        }
+    }
+}
+
+/// Compile plain config inputs into a `LiveConfig`.
 ///
-/// This is the DB load path: adapters are built directly from the JSONB config blob
-/// in each `ClusterConfigRecord`, bypassing the `ClusterConfig` god struct.
-///
-/// `cache` holds adapter instances from the previous generation. Adapters are reused
-/// only when the fingerprint of `engine_key` + JSONB config matches the previous reload;
-/// otherwise they are rebuilt (e.g. engine switch, endpoint, or password changed).
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn build_live_config(
-    cluster_records: &[queryflux_persistence::cluster_config::ClusterConfigRecord],
-    cluster_groups: &std::collections::HashMap<String, queryflux_core::config::ClusterGroupConfig>,
-    cluster_ids_by_name: &HashMap<String, i64>,
-    group_ids_by_name: &HashMap<String, i64>,
-    routers_cfg: &[queryflux_core::config::RouterConfig],
-    routing_fallback: &str,
-    group_translation_scripts: HashMap<String, Vec<String>>,
+/// `cache` carries state from the previous generation: adapters are reused while a
+/// cluster's fingerprint is unchanged, cluster load counters are shared, health and
+/// (for unchanged clusters) breaker state carry over, and each group's last good
+/// strategy is kept. Settings that `LiveConfig` gets from outside this function
+/// (auth, authorization, guard chains, access control, catalog) are set to
+/// placeholders; callers fill them in.
+pub(crate) async fn compile_live_config(
+    inputs: &LiveConfigInputs,
+    ids: &ConfigIds,
     cache: &mut AdapterReloadCache,
+    mode: CompileMode,
 ) -> Result<LiveConfig> {
     use queryflux_cluster_manager::{
         cluster_state::ClusterState,
         simple::SimpleClusterGroupManager,
         strategy::{strategy_from_config, RoundRobinStrategy},
     };
-    use queryflux_core::config::apply_default_probe_queries;
-    use queryflux_core::engine_registry::{
-        cluster_config_from_persisted_json, json_str, parse_auth_from_config_json,
-        parse_engine_key, parse_query_auth_from_config_json,
-    };
     use queryflux_core::tags::QueryTags;
 
-    // Build a lookup map from records for group member resolution.
-    // This includes both base record names and expanded variant names.
-    let records_by_name: HashMap<
-        &str,
-        &queryflux_persistence::cluster_config::ClusterConfigRecord,
-    > = cluster_records
-        .iter()
-        .map(|r| (r.name.as_str(), r))
-        .collect();
-
-    // Expand variants: build a map of all valid cluster names (base + expanded).
-    let mut all_cluster_names: HashSet<String> = HashSet::new();
-    // Track which expanded names map to which parent record (for records_by_name resolution).
-    let mut expanded_to_parent: HashMap<
-        String,
-        &queryflux_persistence::cluster_config::ClusterConfigRecord,
-    > = HashMap::new();
-    // Track expanded cluster configs for each variant.
-    let mut expanded_configs: HashMap<String, ExpandedVariantConfig> = HashMap::new();
-
-    for record in cluster_records {
-        let variants = parse_cluster_variants(&record.variants);
-
-        if variants.is_empty() {
-            all_cluster_names.insert(record.name.clone());
-        } else {
-            let (health_check_query, reconcile_query) = extract_base_probe_queries(&record.config);
-            match queryflux_core::config::expand_cluster_variants(
-                &record.name,
-                &record.config,
-                &record.engine_key,
-                &variants,
-                health_check_query.as_deref(),
-                reconcile_query.as_deref(),
-            ) {
-                Ok(expanded) => {
-                    for exp in expanded {
-                        all_cluster_names.insert(exp.expanded_name.clone());
-                        expanded_to_parent.insert(exp.expanded_name.clone(), record);
-                        expanded_configs.insert(
-                            exp.expanded_name,
-                            (
-                                exp.merged_config,
-                                exp.max_running_queries,
-                                exp.health_check_query,
-                                exp.reconcile_query,
-                            ),
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::error!(cluster = %record.name, error = %err, "Reload: variant expansion failed — cluster omitted");
-                }
-            }
-        }
-    }
+    let clusters = runtime_clusters(&inputs.clusters)?;
+    let by_name: HashMap<&str, &RuntimeCluster> =
+        clusters.iter().map(|c| (c.name.as_str(), c)).collect();
 
     let prev_config_json = cache.config_json.clone();
 
-    // Build adapters — reuse when serialized cluster config is unchanged.
-    // First handle base (non-variant) records.
-    for record in cluster_records {
-        if !parse_cluster_variants(&record.variants).is_empty() {
-            continue; // has variants — handled below
-        }
-
-        let cluster_name_str = &record.name;
-        if !record.enabled {
-            cache.adapters.remove(cluster_name_str.as_str());
-            cache.config_json.remove(cluster_name_str.as_str());
+    // Build adapters, reusing them while the fingerprint is unchanged.
+    for rc in &clusters {
+        if !rc.enabled || rc.engine_type.is_none() {
+            cache.adapters.remove(rc.name.as_str());
+            cache.config_json.remove(rc.name.as_str());
             continue;
         }
-        let cfg_json = serde_json::to_string(&(record.engine_key.as_str(), &record.config))
-            .unwrap_or_default();
-        let reuse = cache.adapters.contains_key(cluster_name_str.as_str())
-            && prev_config_json
-                .get(cluster_name_str.as_str())
-                .map(String::as_str)
-                == Some(cfg_json.as_str());
+        let reuse = cache.adapters.contains_key(rc.name.as_str())
+            && prev_config_json.get(rc.name.as_str()).map(String::as_str)
+                == Some(rc.fingerprint.as_str());
         if reuse {
             continue;
         }
-        cache.adapters.remove(cluster_name_str.as_str());
-        cache.config_json.remove(cluster_name_str.as_str());
-
-        let cluster_name = ClusterName(cluster_name_str.clone());
-        let placeholder_group = ClusterGroupName("_".to_string());
-        let adapter = match registered_engines::build_adapter_from_record(
-            cluster_name,
-            placeholder_group,
-            &record.engine_key,
-            &record.config,
-        )
-        .await
-        {
-            Ok(a) => a,
+        cache.adapters.remove(rc.name.as_str());
+        cache.config_json.remove(rc.name.as_str());
+        match build_adapter(&rc.name, &rc.recipe).await {
+            Ok(adapter) => {
+                cache.adapters.insert(rc.name.clone(), adapter);
+                cache
+                    .config_json
+                    .insert(rc.name.clone(), rc.fingerprint.clone());
+            }
             Err(e) => {
                 tracing::error!(
-                    cluster = %cluster_name_str,
+                    cluster = %rc.name,
                     error = %e,
-                    "Reload: failed to build engine adapter — cluster omitted until fixed"
+                    "Failed to build engine adapter — cluster omitted from routing until config or environment is fixed"
                 );
-                continue;
             }
-        };
-        cache.adapters.insert(cluster_name_str.clone(), adapter);
-        cache.config_json.insert(cluster_name_str.clone(), cfg_json);
-    }
-
-    // Build adapters for expanded variant clusters.
-    for (expanded_name, (merged_config, _, _, _)) in &expanded_configs {
-        let parent = match expanded_to_parent.get(expanded_name) {
-            Some(p) => p,
-            None => continue,
-        };
-        if !parent.enabled {
-            cache.adapters.remove(expanded_name.as_str());
-            cache.config_json.remove(expanded_name.as_str());
-            continue;
         }
-        let cfg_json =
-            serde_json::to_string(&(parent.engine_key.as_str(), merged_config)).unwrap_or_default();
-        let reuse = cache.adapters.contains_key(expanded_name.as_str())
-            && prev_config_json
-                .get(expanded_name.as_str())
-                .map(String::as_str)
-                == Some(cfg_json.as_str());
-        if reuse {
-            continue;
-        }
-        cache.adapters.remove(expanded_name.as_str());
-        cache.config_json.remove(expanded_name.as_str());
-
-        let cluster_name = ClusterName(expanded_name.clone());
-        let placeholder_group = ClusterGroupName("_".to_string());
-        let adapter = match registered_engines::build_adapter_from_record(
-            cluster_name,
-            placeholder_group,
-            &parent.engine_key,
-            merged_config,
-        )
-        .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!(
-                    cluster = %expanded_name,
-                    error = %e,
-                    "Reload: failed to build engine adapter for variant — omitted"
-                );
-                continue;
-            }
-        };
-        cache.adapters.insert(expanded_name.clone(), adapter);
-        cache.config_json.insert(expanded_name.clone(), cfg_json);
     }
-
     cache
         .adapters
-        .retain(|name, _| all_cluster_names.contains(name));
+        .retain(|name, _| by_name.contains_key(name.as_str()));
     cache
         .config_json
-        .retain(|name, _| all_cluster_names.contains(name));
+        .retain(|name, _| by_name.contains_key(name.as_str()));
 
     // Build group states.
     let mut group_states: GroupStatesMap = HashMap::new();
     let mut group_members: HashMap<String, Vec<String>> = HashMap::new();
     let mut group_order: Vec<String> = Vec::new();
 
-    for (group_name, group_config) in cluster_groups {
+    for (group_name, group_config) in &inputs.groups {
         if !group_config.enabled {
             continue;
         }
@@ -444,65 +629,44 @@ pub(crate) async fn build_live_config(
                 tracing::warn!(
                     group = %group_name,
                     cluster = %member_name,
-                    "Reload: duplicate cluster in group members — ignoring extra entry"
+                    "Duplicate cluster in group members — ignoring extra entry"
                 );
                 continue;
             }
-            // Resolve member: check base records first, then expanded variant names.
-            let record = match records_by_name.get(member_name.as_str()) {
-                Some(r) => *r,
-                None => match expanded_to_parent.get(member_name.as_str()) {
-                    Some(r) => *r,
-                    None => {
-                        tracing::warn!(group = %group_name, cluster = %member_name, "Reload: group references unknown cluster");
-                        continue;
-                    }
-                },
+            let Some(rc) = by_name.get(member_name.as_str()) else {
+                if mode == CompileMode::Strict {
+                    anyhow::bail!(
+                        "group '{group_name}' references unknown cluster '{member_name}'"
+                    );
+                }
+                tracing::warn!(group = %group_name, cluster = %member_name, "Group references unknown cluster");
+                continue;
             };
             if !cache.adapters.contains_key(member_name.as_str()) {
-                tracing::info!(group = %group_name, cluster = %member_name, "Reload: skipping disabled/missing cluster in group");
+                tracing::warn!(
+                    group = %group_name,
+                    cluster = %member_name,
+                    "Skipping cluster in group: disabled, or its adapter failed to build"
+                );
                 continue;
             }
-            let engine = match parse_engine_key(&record.engine_key) {
-                Ok(e) => e,
-                Err(_) => continue,
+            let Some(engine_type) = rc.engine_type.clone() else {
+                continue;
             };
-            let engine_type = EngineType::from(&engine);
-            // For expanded variants, use the variant-specific max_running_queries if set.
-            // `?` (not `.unwrap_or_else` — a closure can't propagate `?` out of this
-            // function) so an invalid `max_running_queries` on the base record rejects
-            // the reload here exactly like the non-variant fallback, instead of
-            // silently falling back to the group default.
-            let variant_max_override = expanded_configs
+            let max_q = rc
+                .max_running_queries
+                .unwrap_or(group_config.max_running_queries);
+            let cluster_cid = ids
+                .clusters
                 .get(member_name.as_str())
-                .and_then(|(_, variant_max, _, _)| *variant_max);
-            let max_q = match variant_max_override {
-                Some(v) => v,
-                None => max_running_queries_u64_from_db(member_name, record.max_running_queries)?
-                    .unwrap_or(group_config.max_running_queries),
-            };
-            // For expanded variants, use merged config for endpoint resolution.
-            let effective_config = expanded_configs
-                .get(member_name.as_str())
-                .map(|(cfg, _, _, _)| cfg)
-                .unwrap_or(&record.config);
-            let endpoint = json_str(effective_config, "endpoint");
-            let cluster_cid = cluster_ids_by_name
-                .get(member_name.as_str())
-                .copied()
-                .or_else(|| expanded_to_parent.get(member_name.as_str()).map(|r| r.id));
-            let group_cid = group_ids_by_name.get(group_name.as_str()).copied();
+                .or_else(|| ids.clusters.get(rc.parent.as_str()))
+                .copied();
+            let group_cid = ids.groups.get(group_name.as_str()).copied();
 
-            // When the JSONB + engine_key fingerprint is unchanged, rebuild `ClusterState` from
-            // the current record anyway (group membership, IDs, endpoint, max_q may still change)
-            // but copy health and queue counters from the previous generation.
-            let cfg_json = serde_json::to_string(&(record.engine_key.as_str(), effective_config))
-                .unwrap_or_default();
             let config_unchanged = prev_config_json
                 .get(member_name.as_str())
                 .map(String::as_str)
-                == Some(cfg_json.as_str());
-
+                == Some(rc.fingerprint.as_str());
             let previous = cache
                 .cluster_states
                 .get(&(group_name.clone(), member_name.clone()));
@@ -523,9 +687,9 @@ pub(crate) async fn build_live_config(
                     cluster_cid,
                     group_cid,
                     engine_type,
-                    endpoint,
+                    rc.endpoint.clone(),
                     max_q,
-                    record.enabled,
+                    rc.enabled,
                 )
                 .with_circuit_breaker(group_config.circuit_breaker.clone(), previous_unchanged)
                 .with_shared_load_counters(previous.map(Arc::as_ref)),
@@ -541,19 +705,23 @@ pub(crate) async fn build_live_config(
                 cache.strategies.insert(group_name.clone(), s.clone());
                 s
             }
+            Err(e) if mode == CompileMode::Strict => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("group '{group_name}' cluster-selection strategy")));
+            }
             Err(e) => {
                 if let Some(prev) = cache.strategies.get(group_name.as_str()) {
                     tracing::warn!(
                         group = %group_name,
                         error = %e,
-                        "Reload: failed to build cluster-selection strategy; keeping this group's previous strategy"
+                        "Failed to build cluster-selection strategy; keeping this group's previous strategy"
                     );
                     prev.clone()
                 } else {
                     tracing::warn!(
                         group = %group_name,
                         error = %e,
-                        "Reload: failed to build cluster-selection strategy; no previous strategy cached, falling back to round robin"
+                        "Failed to build cluster-selection strategy; no previous strategy cached, falling back to round robin"
                     );
                     Arc::new(RoundRobinStrategy::new())
                 }
@@ -568,7 +736,7 @@ pub(crate) async fn build_live_config(
     // group name can't inherit the old group's strategy if the new one's build ever fails.
     cache
         .strategies
-        .retain(|name, _| cluster_groups.contains_key(name.as_str()));
+        .retain(|name, _| inputs.groups.contains_key(name.as_str()));
 
     let health_check_targets = health_targets_from_groups(&group_states, &cache.adapters);
     let rebuilt_cluster_states = health_check_targets
@@ -582,211 +750,60 @@ pub(crate) async fn build_live_config(
         .collect();
     let cluster_manager = Arc::new(SimpleClusterGroupManager::new(group_states));
 
-    // Build minimal ClusterConfig values for BackendIdentityResolver (`queryAuth` from JSONB).
-    let mut cluster_configs: HashMap<String, queryflux_core::config::ClusterConfig> =
-        HashMap::new();
-    for r in cluster_records {
-        let engine = match parse_engine_key(&r.engine_key) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(cluster = %r.name, "reload: {err}");
-                continue;
-            }
-        };
-        let query_auth = parse_query_auth_from_config_json(&r.config).map_err(|e| {
-            anyhow::anyhow!("cluster '{}': invalid queryAuth in JSONB: {e}", r.name)
-        })?;
-        let auth = match parse_auth_from_config_json(&r.config) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!(
-                    cluster = %r.name,
-                    "reload: invalid auth in cluster config JSON: {e}"
-                );
-                None
-            }
-        };
-        let max_running = max_running_queries_u64_from_db(&r.name, r.max_running_queries)?;
-        let base_cfg = cluster_config_from_persisted_json(
-            engine.clone(),
-            r.enabled,
-            max_running,
-            &r.config,
-            auth.clone(),
-            query_auth.clone(),
-        );
+    let cluster_configs: HashMap<String, queryflux_core::config::ClusterConfig> = clusters
+        .iter()
+        .filter_map(|rc| rc.cluster_config.clone().map(|c| (rc.name.clone(), c)))
+        .collect();
 
-        let variants = parse_cluster_variants(&r.variants);
-        if variants.is_empty() {
-            let mut base_cfg = base_cfg;
-            apply_default_probe_queries(&mut base_cfg, &r.engine_key, &r.config);
-            cluster_configs.insert(r.name.clone(), base_cfg);
-        } else {
-            // Insert a ClusterConfig entry for each expanded variant name.
-            for (expanded_name, (_, variant_max, hcq, rq)) in &expanded_configs {
-                if expanded_name.starts_with(&format!("{}::", r.name)) {
-                    let mut variant_cfg = base_cfg.clone();
-                    variant_cfg.max_running_queries = variant_max.or(max_running);
-                    variant_cfg.health_check_query = hcq.clone();
-                    variant_cfg.reconcile_query = rq.clone();
-                    cluster_configs.insert(expanded_name.clone(), variant_cfg);
-                }
-            }
-        }
-    }
+    let router_chain = build_router_chain(&inputs.routers, &inputs.routing_fallback, mode)?;
 
-    // Build router chain.
-    let fallback = ClusterGroupName(routing_fallback.to_string());
-    let mut routers: Vec<Box<dyn RouterTrait>> = Vec::new();
-    for router_cfg in routers_cfg {
-        use queryflux_core::config::RouterConfig;
-        match router_cfg {
-            RouterConfig::ProtocolBased {
-                trino_http,
-                postgres_wire,
-                mysql_wire,
-                clickhouse_http,
-                flight_sql,
-                snowflake_http,
-                snowflake_sql_api,
-                mcp,
-            } => {
-                routers.push(Box::new(
-                    queryflux_routing::implementations::protocol_based::ProtocolBasedRouter {
-                        trino_http: trino_http.as_ref().map(|s| ClusterGroupName(s.clone())),
-                        postgres_wire: postgres_wire.as_ref().map(|s| ClusterGroupName(s.clone())),
-                        mysql_wire: mysql_wire.as_ref().map(|s| ClusterGroupName(s.clone())),
-                        clickhouse_http: clickhouse_http
-                            .as_ref()
-                            .map(|s| ClusterGroupName(s.clone())),
-                        flight_sql: flight_sql.as_ref().map(|s| ClusterGroupName(s.clone())),
-                        snowflake_http: snowflake_http
-                            .as_ref()
-                            .map(|s| ClusterGroupName(s.clone())),
-                        snowflake_sql_api: snowflake_sql_api
-                            .as_ref()
-                            .map(|s| ClusterGroupName(s.clone())),
-                        mcp: mcp.as_ref().map(|s| ClusterGroupName(s.clone())),
-                    },
-                ));
-            }
-            RouterConfig::Header {
-                header_name,
-                header_value_to_group,
-            } => {
-                let mapping = header_value_to_group
-                    .iter()
-                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
-                    .collect();
-                routers.push(Box::new(
-                    queryflux_routing::implementations::header::HeaderRouter::new(
-                        header_name.clone(),
-                        mapping,
-                    ),
-                ));
-            }
-            RouterConfig::UserGroup { user_to_group } => {
-                let mapping = user_to_group
-                    .iter()
-                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
-                    .collect();
-                routers.push(Box::new(
-                    queryflux_routing::implementations::user_group::UserGroupRouter::new(mapping),
-                ));
-            }
-            RouterConfig::QueryRegex { rules } => {
-                routers.push(Box::new(
-                    queryflux_routing::implementations::query_regex::QueryRegexRouter::from_rules(
-                        rules.clone(),
-                    ),
-                ));
-            }
-            RouterConfig::Tags { rules } => {
-                routers.push(Box::new(
-                    queryflux_routing::implementations::tags::TagsRouter::new(rules.clone()),
-                ));
-            }
-            RouterConfig::PythonScript {
-                script,
-                script_file,
-            } => {
-                let router = if let Some(path) = script_file {
-                    match queryflux_routing::implementations::python_script::PythonScriptRouter::from_file(path) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("Reload: failed to load routing script from {path}: {e}");
-                            continue;
-                        }
-                    }
-                } else {
-                    queryflux_routing::implementations::python_script::PythonScriptRouter::new(
-                        script.clone(),
-                    )
-                };
-                routers.push(Box::new(router));
-            }
-            RouterConfig::Compound {
-                combine,
-                conditions,
-                target_group,
-            } => {
-                routers.push(Box::new(
-                    queryflux_routing::implementations::compound::CompoundRouter::new(
-                        *combine,
-                        conditions.clone(),
-                        target_group.clone(),
-                    ),
-                ));
-            }
-        }
-    }
-    let router_chain = RouterChain::new(routers, fallback);
-
-    let group_default_tags: HashMap<String, QueryTags> = cluster_groups
+    let group_default_tags: HashMap<String, QueryTags> = inputs
+        .groups
         .iter()
         .filter(|(_, g)| !g.default_tags.is_empty())
         .map(|(name, g)| (name.clone(), g.default_tags.clone()))
         .collect();
 
-    let group_max_queued_queries: HashMap<String, Option<u64>> = cluster_groups
+    let group_max_queued_queries: HashMap<String, Option<u64>> = inputs
+        .groups
         .iter()
         .filter(|(_, g)| g.max_queued_queries.is_some())
         .map(|(name, g)| (name.clone(), g.max_queued_queries))
         .collect();
 
-    let group_capacity_wait_timeout_secs: HashMap<String, u64> = cluster_groups
+    let group_capacity_wait_timeout_secs: HashMap<String, u64> = inputs
+        .groups
         .iter()
         .map(|(name, g)| (name.clone(), g.capacity_wait_timeout_secs_or_default()))
         .collect();
 
-    let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> =
-        cluster_groups
-            .iter()
-            .filter_map(|(name, g)| {
-                g.cache
-                    .as_ref()
-                    .filter(|c| c.enabled)
-                    .map(|c| (name.clone(), c.clone()))
-            })
-            .collect();
+    let group_cache_settings: HashMap<String, queryflux_core::config::GroupCacheConfig> = inputs
+        .groups
+        .iter()
+        .filter_map(|(name, g)| {
+            g.cache
+                .as_ref()
+                .filter(|c| c.enabled)
+                .map(|c| (name.clone(), c.clone()))
+        })
+        .collect();
 
-    // Referential integrity: routers must target groups that exist in this reload cycle,
-    // and every declared group member must have a built adapter. A stale read (e.g. a
-    // group deleted between the cluster read and the group read) would produce a live
+    // Referential integrity: routers must target groups that exist in this config, and
+    // every declared group member must have a built adapter. A stale read (e.g. a group
+    // deleted between the cluster read and the group read) would otherwise produce a live
     // config where dispatch returns NoClusterGroupAvailable with no explanation.
-    // On any inconsistency, bail out so the caller keeps the previous LiveConfig.
     let issues = validate_live_config_refs(
-        routers_cfg,
-        routing_fallback,
+        &inputs.routers,
+        &inputs.routing_fallback,
         &group_members,
         &cache.adapters,
     );
     if !issues.is_empty() {
         for issue in &issues {
-            tracing::warn!("Live config validation: {issue}");
+            tracing::error!("Config validation: {issue}");
         }
         return Err(anyhow::anyhow!(
-            "Live config is internally inconsistent ({} issue(s)); keeping previous config",
+            "Config has {} referential integrity error(s)",
             issues.len()
         ));
     }
@@ -806,10 +823,10 @@ pub(crate) async fn build_live_config(
     cache.cluster_states = rebuilt_cluster_states;
     Ok(LiveConfig {
         router_chain,
+        // Placeholders: callers fill these in (startup from YAML/DB settings, reload by
+        // carrying forward the previous value or rebuilding from DB settings).
         guard_chain: None,
         group_guard_chains: HashMap::new(),
-        // Placeholder — `reload_live_config` immediately carries forward the previous
-        // value, same as `guard_chain`/`group_guard_chains` above.
         access_control_guard: None,
         cluster_manager,
         adapters: cache.adapters.clone(),
@@ -819,18 +836,115 @@ pub(crate) async fn build_live_config(
         cluster_configs,
         group_members,
         group_order,
-        group_translation_scripts,
+        group_translation_scripts: inputs.group_translation_scripts.clone(),
         group_default_tags,
         group_max_queued_queries,
         group_capacity_wait_timeout_secs,
         group_cache_settings,
         auth_provider: Arc::new(NoneAuthProvider::new(false)),
         authorization: Arc::new(AllowAllAuthorization::default()),
-        // Placeholder — `reload_live_config` immediately overwrites this with the
-        // carried-forward previous value (and possibly a fresh one from
-        // `catalog_config`), same as `auth_provider`/`authorization` above.
         catalog: Arc::new(queryflux_core::catalog::NullCatalogProvider),
     })
+}
+
+fn build_router_chain(
+    routers_cfg: &[queryflux_core::config::RouterConfig],
+    routing_fallback: &str,
+    mode: CompileMode,
+) -> Result<RouterChain> {
+    use queryflux_core::config::RouterConfig;
+    use queryflux_routing::implementations::{
+        compound::CompoundRouter, header::HeaderRouter, protocol_based::ProtocolBasedRouter,
+        python_script::PythonScriptRouter, query_regex::QueryRegexRouter, tags::TagsRouter,
+        user_group::UserGroupRouter,
+    };
+
+    let fallback = ClusterGroupName(routing_fallback.to_string());
+    let mut routers: Vec<Box<dyn RouterTrait>> = Vec::new();
+    for router_cfg in routers_cfg {
+        match router_cfg {
+            RouterConfig::ProtocolBased {
+                trino_http,
+                postgres_wire,
+                mysql_wire,
+                clickhouse_http,
+                flight_sql,
+                snowflake_http,
+                snowflake_sql_api,
+                mcp,
+            } => {
+                routers.push(Box::new(ProtocolBasedRouter {
+                    trino_http: trino_http.as_ref().map(|s| ClusterGroupName(s.clone())),
+                    postgres_wire: postgres_wire.as_ref().map(|s| ClusterGroupName(s.clone())),
+                    mysql_wire: mysql_wire.as_ref().map(|s| ClusterGroupName(s.clone())),
+                    clickhouse_http: clickhouse_http
+                        .as_ref()
+                        .map(|s| ClusterGroupName(s.clone())),
+                    flight_sql: flight_sql.as_ref().map(|s| ClusterGroupName(s.clone())),
+                    snowflake_http: snowflake_http.as_ref().map(|s| ClusterGroupName(s.clone())),
+                    snowflake_sql_api: snowflake_sql_api
+                        .as_ref()
+                        .map(|s| ClusterGroupName(s.clone())),
+                    mcp: mcp.as_ref().map(|s| ClusterGroupName(s.clone())),
+                }));
+            }
+            RouterConfig::Header {
+                header_name,
+                header_value_to_group,
+            } => {
+                let mapping = header_value_to_group
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
+                    .collect();
+                routers.push(Box::new(HeaderRouter::new(header_name.clone(), mapping)));
+            }
+            RouterConfig::UserGroup { user_to_group } => {
+                let mapping = user_to_group
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ClusterGroupName(v.clone())))
+                    .collect();
+                routers.push(Box::new(UserGroupRouter::new(mapping)));
+            }
+            RouterConfig::QueryRegex { rules } => {
+                routers.push(Box::new(QueryRegexRouter::from_rules(rules.clone())));
+            }
+            RouterConfig::Tags { rules } => {
+                routers.push(Box::new(TagsRouter::new(rules.clone())));
+            }
+            RouterConfig::PythonScript {
+                script,
+                script_file,
+            } => {
+                let router = match script_file {
+                    Some(path) => match PythonScriptRouter::from_file(path) {
+                        Ok(r) => r,
+                        Err(e) if mode == CompileMode::Strict => {
+                            return Err(anyhow::Error::from(e)
+                                .context(format!("Failed to load routing script from {path}")));
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to load routing script from {path}: {e}");
+                            continue;
+                        }
+                    },
+                    None => PythonScriptRouter::new(script.clone()),
+                };
+                routers.push(Box::new(router));
+            }
+            RouterConfig::Compound {
+                combine,
+                conditions,
+                target_group,
+            } => {
+                routers.push(Box::new(CompoundRouter::new(
+                    *combine,
+                    conditions.clone(),
+                    target_group.clone(),
+                )));
+            }
+        }
+    }
+    Ok(RouterChain::new(routers, fallback))
 }
 
 /// Load cluster/group configs + routing config from Postgres and build a fresh `LiveConfig`.
@@ -860,25 +974,11 @@ pub(crate) async fn reload_live_config(
         .list_cluster_configs()
         .await
         .context("reload: list_cluster_configs")?;
-    let mut cluster_ids_by_name: HashMap<String, i64> = cluster_records
-        .iter()
-        .map(|r| (r.name.clone(), r.id))
-        .collect();
-    // Also map expanded variant names to their parent's DB ID.
-    for r in &cluster_records {
-        for v in &parse_cluster_variants(&r.variants) {
-            cluster_ids_by_name.insert(format!("{}::{}", r.name, v.name), r.id);
-        }
-    }
-
     let group_records = pg
         .list_group_configs()
         .await
         .context("reload: list_group_configs")?;
-    let group_ids_by_name: HashMap<String, i64> = group_records
-        .iter()
-        .map(|r| (r.name.clone(), r.id))
-        .collect();
+    let ids = ConfigIds::from_records(&cluster_records, &group_records);
     let cluster_groups: std::collections::HashMap<
         String,
         queryflux_core::config::ClusterGroupConfig,
@@ -919,17 +1019,14 @@ pub(crate) async fn reload_live_config(
     let group_translation_scripts = validate_group_translation_scripts(group_translation_scripts);
     let guard_script_bodies = load_guard_script_bodies(Some(pg.as_ref() as &dyn AdminStore)).await;
 
-    let mut live = build_live_config(
+    let inputs = LiveConfigInputs::from_records(
         &cluster_records,
-        &cluster_groups,
-        &cluster_ids_by_name,
-        &group_ids_by_name,
-        &routers_cfg,
-        &routing_fallback,
+        cluster_groups,
+        routers_cfg,
+        routing_fallback,
         group_translation_scripts,
-        cache,
-    )
-    .await?;
+    );
+    let mut live = compile_live_config(&inputs, &ids, cache, CompileMode::Lenient).await?;
 
     // Carry forward the pieces build_live_config seeds with placeholders. The
     // DB reads below only *override* these on success — a missing row or a
@@ -983,7 +1080,7 @@ pub(crate) async fn reload_live_config(
             match auth_cfg {
                 Some(auth) => {
                     let operators = operators_from_auth(&auth);
-                    match authz_cfg.map(|cfg| build_authorization(&cfg, &cluster_groups, operators))
+                    match authz_cfg.map(|cfg| build_authorization(&cfg, &inputs.groups, operators))
                     {
                         Some(Ok(checker)) => live.authorization = checker,
                         Some(Err(e)) => {
@@ -1060,4 +1157,222 @@ pub(crate) async fn reload_live_config(
     }
 
     Ok(live)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queryflux_core::config::{ClusterConfig, ClusterGroupConfig};
+
+    fn group(mut json: serde_json::Value) -> ClusterGroupConfig {
+        if json.get("maxRunningQueries").is_none() {
+            json["maxRunningQueries"] = serde_json::json!(10);
+        }
+        serde_json::from_value(json).expect("valid group fixture")
+    }
+
+    fn empty_cache() -> AdapterReloadCache {
+        AdapterReloadCache {
+            adapters: HashMap::new(),
+            config_json: HashMap::new(),
+            cluster_states: HashMap::new(),
+            routing_fallback: String::new(),
+            routers_cfg: Vec::new(),
+            strategies: HashMap::new(),
+        }
+    }
+
+    fn persisted(
+        name: &str,
+        config: serde_json::Value,
+        variants: serde_json::Value,
+    ) -> ClusterSpec {
+        ClusterSpec {
+            name: name.to_string(),
+            enabled: true,
+            source: ClusterSource::Persisted {
+                engine_key: "duckDb".to_string(),
+                max_running_queries: Some(3),
+                config,
+                variants,
+            },
+        }
+    }
+
+    fn inputs(
+        clusters: Vec<ClusterSpec>,
+        groups: Vec<(&str, ClusterGroupConfig)>,
+    ) -> LiveConfigInputs {
+        LiveConfigInputs {
+            clusters,
+            groups: groups
+                .into_iter()
+                .map(|(n, g)| (n.to_string(), g))
+                .collect(),
+            routing_fallback: "g".to_string(),
+            ..LiveConfigInputs::default()
+        }
+    }
+
+    async fn compile(
+        i: &LiveConfigInputs,
+        ids: &ConfigIds,
+        mode: CompileMode,
+    ) -> Result<LiveConfig> {
+        compile_live_config(i, ids, &mut empty_cache(), mode).await
+    }
+
+    /// A YAML cluster and the same cluster as Postgres stores it (via the YAML seed
+    /// conversion) compile to the same groups, members, limits and adapters.
+    #[tokio::test]
+    async fn yaml_and_persisted_specs_compile_to_the_same_live_config() {
+        let yaml: ClusterConfig = serde_json::from_value(serde_json::json!({
+            "engine": "duckDb",
+            "maxRunningQueries": 3
+        }))
+        .expect("valid cluster fixture");
+        let upsert = queryflux_persistence::cluster_config::UpsertClusterConfig::from_core(&yaml)
+            .expect("serializes")
+            .expect("has an engine");
+        let as_persisted = ClusterSpec {
+            name: "duck".to_string(),
+            enabled: upsert.enabled,
+            source: ClusterSource::Persisted {
+                engine_key: upsert.engine_key,
+                max_running_queries: upsert.max_running_queries,
+                config: upsert.config,
+                variants: upsert.variants,
+            },
+        };
+        let g = || group(serde_json::json!({ "members": ["duck"], "maxRunningQueries": 10 }));
+
+        let from_yaml = compile(
+            &inputs(
+                vec![ClusterSpec::from_yaml("duck", &yaml)],
+                vec![("g", g())],
+            ),
+            &ConfigIds::default(),
+            CompileMode::Strict,
+        )
+        .await
+        .expect("YAML compiles");
+        let from_db = compile(
+            &inputs(vec![as_persisted], vec![("g", g())]),
+            &ConfigIds::default(),
+            CompileMode::Strict,
+        )
+        .await
+        .expect("persisted compiles");
+
+        for live in [&from_yaml, &from_db] {
+            assert_eq!(live.group_members.get("g"), Some(&vec!["duck".to_string()]));
+            assert!(live.adapters.contains_key("duck"));
+            let states = live.cluster_manager.all_cluster_states().await.unwrap();
+            assert_eq!(states.len(), 1);
+            assert_eq!(states[0].max_running_queries, 3);
+            assert_eq!(
+                live.cluster_configs
+                    .get("duck")
+                    .and_then(|c| c.max_running_queries),
+                Some(3)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_mode_rejects_an_unknown_group_member() {
+        let i = inputs(
+            vec![],
+            vec![("g", group(serde_json::json!({ "members": ["missing"] })))],
+        );
+        let err = compile(&i, &ConfigIds::default(), CompileMode::Strict)
+            .await
+            .err()
+            .expect("strict rejects");
+        assert!(
+            err.to_string()
+                .contains("references unknown cluster 'missing'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_mode_rejects_a_strategy_that_fails_to_build_lenient_falls_back() {
+        let i = inputs(
+            vec![persisted(
+                "duck",
+                serde_json::json!({}),
+                serde_json::json!([]),
+            )],
+            vec![(
+                "g",
+                group(serde_json::json!({
+                    "members": ["duck"],
+                    "strategy": { "type": "pythonScript" }
+                })),
+            )],
+        );
+        assert!(compile(&i, &ConfigIds::default(), CompileMode::Strict)
+            .await
+            .is_err());
+        assert!(compile(&i, &ConfigIds::default(), CompileMode::Lenient)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn strict_mode_rejects_an_unreadable_routing_script_lenient_skips_it() {
+        let mut i = inputs(
+            vec![persisted(
+                "duck",
+                serde_json::json!({}),
+                serde_json::json!([]),
+            )],
+            vec![("g", group(serde_json::json!({ "members": ["duck"] })))],
+        );
+        i.routers = vec![serde_json::from_value(serde_json::json!({
+            "type": "pythonScript",
+            "script": "",
+            "scriptFile": "/nonexistent/queryflux-router.py"
+        }))
+        .expect("valid router fixture")];
+        let err = compile(&i, &ConfigIds::default(), CompileMode::Strict)
+            .await
+            .err()
+            .expect("strict rejects");
+        assert!(
+            err.to_string().contains("Failed to load routing script"),
+            "{err}"
+        );
+        assert!(compile(&i, &ConfigIds::default(), CompileMode::Lenient)
+            .await
+            .is_ok());
+    }
+
+    /// Variant clusters have no row of their own; they get their parent's id.
+    #[tokio::test]
+    async fn variant_clusters_get_their_parents_database_id() {
+        let i = inputs(
+            vec![persisted(
+                "duck",
+                serde_json::json!({}),
+                serde_json::json!([{ "name": "a" }]),
+            )],
+            vec![("g", group(serde_json::json!({ "members": ["duck::a"] })))],
+        );
+        let ids = ConfigIds {
+            clusters: HashMap::from([("duck".to_string(), 7)]),
+            groups: HashMap::from([("g".to_string(), 9)]),
+        };
+        let live = compile(&i, &ids, CompileMode::Strict)
+            .await
+            .expect("compiles");
+        let (_, state) = live
+            .health_check_targets
+            .iter()
+            .find(|(_, s)| s.cluster_name.0 == "duck::a")
+            .expect("variant is a group member");
+        assert_eq!(state.cluster_config_id, Some(7));
+        assert_eq!(state.cluster_group_config_id, Some(9));
+    }
 }
