@@ -526,6 +526,28 @@ pub trait BackendStore: Persistence + MetricsStore + AdminStore + CacheStore + S
 impl<T: Persistence + MetricsStore + AdminStore + CacheStore + Send + Sync> BackendStore for T {}
 
 // ---------------------------------------------------------------------------
+// CoordinationStore — the coordination a query path and its background tasks need
+// ---------------------------------------------------------------------------
+
+/// Shared capacity leases, single-owner sweep locks and published engine counts:
+/// everything admission and the background lease/reconcile/sweep tasks need to
+/// coordinate replicas.
+///
+/// Deliberately narrower than [`DistributedBackendStore`]: no config, history or
+/// cache storage, and no queued-query claims. That lets a process that owns no
+/// database (a worker, #255) provide coordination some other way, for example over
+/// HTTP to its control plane. Blanket-implemented for any type with the parts.
+pub trait CoordinationStore:
+    CapacityStore + SweepCoordinator + BackendCapabilities + Send + Sync
+{
+}
+
+impl<T: CapacityStore + SweepCoordinator + BackendCapabilities + Send + Sync> CoordinationStore
+    for T
+{
+}
+
+// ---------------------------------------------------------------------------
 // DistributedBackendStore — multi-replica coordination (optional layer)
 // ---------------------------------------------------------------------------
 
@@ -561,4 +583,71 @@ impl<
             + Sync,
     > DistributedBackendStore for T
 {
+}
+
+#[cfg(test)]
+mod coordination_store_tests {
+    use super::*;
+
+    fn assert_coordination_store<T: CoordinationStore>() {}
+
+    #[test]
+    fn existing_backends_provide_coordination() {
+        assert_coordination_store::<in_memory::InMemoryPersistence>();
+        assert_coordination_store::<postgres::PostgresStore>();
+    }
+
+    /// Leases, locks and counts only: no config, history or cache storage. This is the
+    /// shape a database-less worker can provide over HTTP.
+    struct LeasesOnly;
+
+    #[async_trait]
+    impl CapacityStore for LeasesOnly {
+        async fn try_acquire(&self, _: &str, _: u64, _: &str, _: &str) -> Result<bool> {
+            Ok(true)
+        }
+        async fn release(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn heartbeat(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn expire_stale(&self, _: DateTime<Utc>) -> Result<u64> {
+            Ok(0)
+        }
+        async fn active_count(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn publish_running_count(&self, _: &str, _: u64) -> Result<()> {
+            Ok(())
+        }
+        async fn active_lease_count(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+        async fn release_all_for_instance(&self, _: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[async_trait]
+    impl SweepCoordinator for LeasesOnly {
+        async fn try_sweep_lock(&self, _: &str) -> Result<Option<Box<dyn SweepGuard>>> {
+            Ok(None)
+        }
+    }
+
+    impl BackendCapabilities for LeasesOnly {
+        fn supports_distributed_coordination(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_without_a_database_can_coordinate() {
+        let store: std::sync::Arc<dyn CoordinationStore> = std::sync::Arc::new(LeasesOnly);
+        assert!(store.supports_distributed_coordination());
+        let capacity: std::sync::Arc<dyn CapacityStore> = store.clone();
+        assert!(capacity.try_acquire("c", 1, "i", "q").await.unwrap());
+        assert!(store.try_sweep_lock("reconcile").await.unwrap().is_none());
+    }
 }

@@ -25,7 +25,7 @@ use queryflux_metrics::{
 };
 use queryflux_persistence::{
     in_memory::InMemoryPersistence, postgres::PostgresStore, AdminStore, BackendStore,
-    DistributedBackendStore,
+    CoordinationStore, DistributedBackendStore,
 };
 use queryflux_translation::TranslationService;
 use tracing::info;
@@ -292,7 +292,11 @@ async fn main() -> Result<()> {
     let backend: Option<Arc<dyn BackendStore>> = pg_store.clone().map(|pg| pg as _);
     // Multi-replica coordination is optional: only backends that also implement
     // `DistributedBackendStore` (Postgres today) are stored here.
-    let distributed_backend: Option<Arc<dyn DistributedBackendStore>> = pg_store.map(|pg| pg as _);
+    let distributed_backend: Option<Arc<dyn DistributedBackendStore>> =
+        pg_store.clone().map(|pg| pg as _);
+    // The narrower view admission and the lease/reconcile/sweep tasks use: leases, sweep
+    // locks and published engine counts, without config or history storage.
+    let coordination: Option<Arc<dyn CoordinationStore>> = pg_store.map(|pg| pg as _);
 
     // Filled when Postgres loads cluster/group rows — used for query_history FKs on ClusterState.
     let mut cluster_ids_by_name: HashMap<String, i64> = HashMap::new();
@@ -680,7 +684,7 @@ async fn main() -> Result<()> {
     let distributed = config
         .queryflux
         .resolve_distributed(
-            distributed_backend
+            coordination
                 .as_ref()
                 .is_some_and(|b| b.supports_distributed_coordination()),
         )
@@ -697,7 +701,7 @@ async fn main() -> Result<()> {
 
     let capacity_store: Option<Arc<dyn queryflux_persistence::CapacityStore>> = distributed
         .then(|| {
-            distributed_backend
+            coordination
                 .clone()
                 .map(|b| b as Arc<dyn queryflux_persistence::CapacityStore>)
         })
@@ -953,7 +957,7 @@ async fn main() -> Result<()> {
         let state = app_state.clone();
         let prometheus = prometheus.clone();
         let backend = backend.clone();
-        let distributed_backend = distributed_backend.clone();
+        let coordination = coordination.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -983,7 +987,7 @@ async fn main() -> Result<()> {
                 prometheus.sync_circuit_breaker_states(&breaker_states);
                 let mut records = Vec::with_capacity(snapshots.len());
                 for snap in snapshots {
-                    let global_running = if let Some(db) = &distributed_backend {
+                    let global_running = if let Some(db) = &coordination {
                         let store = db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
                         store
                             .active_count(&snap.cluster_name.0)
@@ -1010,7 +1014,7 @@ async fn main() -> Result<()> {
                 // coordination failure fails open (duplicate rows beat no rows).
                 // A non-coordinating backend persists unconditionally — it
                 // cannot dedup across replicas anyway.
-                let lock = match &distributed_backend {
+                let lock = match &coordination {
                     Some(db) => match db.try_sweep_lock("cluster-snapshots").await {
                         Ok(Some(lock)) => Some(Some(lock)),
                         Ok(None) => None, // another replica persists this cycle
@@ -1063,7 +1067,7 @@ async fn main() -> Result<()> {
     // Also expires stale capacity leases from crashed replicas.
     tokio::spawn({
         let state = app_state.clone();
-        let distributed_backend = distributed_backend.clone();
+        let coordination = coordination.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300; // matches Trino's query.client.timeout default
@@ -1078,7 +1082,7 @@ async fn main() -> Result<()> {
                 // holding the advisory lock runs them this cycle. A crashed owner's
                 // lock is released with its connection, so another replica takes
                 // over on its next tick. On lock errors, fail open and sweep anyway.
-                let sweep_lock = match &distributed_backend {
+                let sweep_lock = match &coordination {
                     Some(backend) => match backend.try_sweep_lock("zombie-eviction").await {
                         Ok(Some(lock)) => Some(lock),
                         Ok(None) => continue, // another replica owns this cycle
@@ -1174,7 +1178,7 @@ async fn main() -> Result<()> {
     // deletes queued entries not accessed for > 5 minutes.
     tokio::spawn({
         let state = app_state.clone();
-        let distributed_backend = distributed_backend.clone();
+        let coordination = coordination.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             const CLIENT_TIMEOUT_SECS: i64 = 300;
@@ -1184,7 +1188,7 @@ async fn main() -> Result<()> {
                     break;
                 }
 
-                let sweep_lock = match &distributed_backend {
+                let sweep_lock = match &coordination {
                     Some(backend) => match backend.try_sweep_lock("stale-queued-eviction").await {
                         Ok(Some(lock)) => Some(lock),
                         Ok(None) => continue,
@@ -1391,7 +1395,7 @@ async fn main() -> Result<()> {
     // queries backends; it publishes counts to Postgres and other replicas sync locally.
     tokio::spawn({
         let state = app_state.clone();
-        let distributed_backend = distributed_backend.clone();
+        let coordination = coordination.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1408,7 +1412,7 @@ async fn main() -> Result<()> {
                 };
                 let targets = reconcile_targets_from_health_targets(&targets);
 
-                if let Some(ref db) = distributed_backend {
+                if let Some(ref db) = coordination {
                     let capacity_store =
                         db.clone() as Arc<dyn queryflux_persistence::CapacityStore>;
                     match db.try_sweep_lock("engine-reconcile").await {
