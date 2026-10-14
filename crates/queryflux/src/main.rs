@@ -16,7 +16,6 @@ use queryflux_frontend::{
     mysql_wire::MysqlWireFrontend,
     postgres_wire::PostgresWireFrontend,
     snowflake::SnowflakeFrontend,
-    state::LiveConfig,
     trino_http::{state::AppState, TrinoHttpFrontend},
     FrontendListenerTrait,
 };
@@ -31,19 +30,23 @@ use queryflux_persistence::{
 use queryflux_translation::TranslationService;
 use tracing::info;
 
+mod config_source;
 mod guards;
 mod live_config;
 mod registered_engines;
 
+use crate::config_source::{
+    run_reload_loop, AdminStoreConfigSource, ConfigSource, LiveHandles, PostgresConfigSource,
+    ReloadTriggers,
+};
 use crate::guards::{
-    apply_stored_access_control, build_access_control_guard, build_auth_provider,
-    build_authorization, build_guard_chains, build_guard_chains_from_db_value,
-    load_guard_script_bodies, load_guard_script_bodies_from_admin, operators_from_auth,
+    build_access_control_guard, build_auth_provider, build_authorization, build_guard_chains,
+    build_guard_chains_from_db_value, load_guard_script_bodies, operators_from_auth,
     validate_group_translation_scripts,
 };
 use crate::live_config::{
-    cluster_configs_from_specs, compile_live_config, reload_live_config, AdapterReloadCache,
-    ClusterSpec, CompileMode, ConfigIds, LiveConfigInputs, PreservedLive,
+    cluster_configs_from_specs, compile_live_config, AdapterReloadCache, ClusterSpec, CompileMode,
+    ConfigIds, LiveConfigInputs,
 };
 
 type FrontendTaskResult = queryflux_core::error::Result<()>;
@@ -1287,26 +1290,12 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Background task: hot-reload routing rules + cluster configs from the DB when:
-    //   1. Another replica bumps the config revision (distributed LISTEN/NOTIFY via ConfigRevisionStore)
-    //   2. This replica's admin API writes config (local tokio::sync::Notify fast-path)
-    //   3. A periodic timer fires (safety-net polling, configurable via configReloadIntervalSecs)
-    //
-    // When no durable backend is configured, only local Notify triggers guard-chain reloads.
-    tokio::spawn({
-        let live = live.clone();
-        let backend = backend.clone();
-        let cache = adapter_reload_cache.clone();
-        let notify = config_reload_notify.clone();
-        let admin_for_reload = admin_store_for_reload;
-        let metrics = app_state.metrics.clone();
-        let periodic_secs = config.queryflux.periodic_config_reload_interval_secs();
-        let mut shutdown_rx = shutdown_rx.clone();
-
-        // Subscribe to distributed config revision changes (push where the
-        // backend supports it, e.g. Postgres LISTEN/NOTIFY).
-        let revision_rx = if let Some(backend) = &backend {
-            match backend.subscribe_revisions().await {
+    // Background task: hot-reload config. The source decides when (admin writes on this
+    // replica, revision changes from other replicas, a periodic safety-net timer) and how
+    // (Postgres rows, or in YAML mode only the settings stored through the admin API).
+    {
+        let revisions = match &backend {
+            Some(backend) => match backend.subscribe_revisions().await {
                 Ok(Some(rx)) => {
                     tracing::info!("Subscribed to backend config revision notifications");
                     Some(rx)
@@ -1316,215 +1305,29 @@ async fn main() -> Result<()> {
                     tracing::warn!("Failed to subscribe to config revision notifications: {e}");
                     None
                 }
-            }
-        } else {
-            None
+            },
+            None => None,
         };
-
-        async move {
-            async fn do_reload(
-                backend: &Arc<dyn BackendStore>,
-                cache: &tokio::sync::Mutex<AdapterReloadCache>,
-                live: &Arc<tokio::sync::RwLock<LiveConfig>>,
-                metrics: &Arc<dyn MetricsStore>,
-            ) {
-                let mut cache_guard = cache.lock().await;
-                // Snapshot the pieces a reload must never silently weaken; the
-                // read guard is dropped before the write below.
-                let prev = {
-                    let l = live.read().await;
-                    PreservedLive {
-                        auth_provider: l.auth_provider.clone(),
-                        authorization: l.authorization.clone(),
-                        guard_chain: l.guard_chain.clone(),
-                        group_guard_chains: l.group_guard_chains.clone(),
-                        access_control_guard: l.access_control_guard.clone(),
-                        catalog: l.catalog.clone(),
-                    }
-                };
-                // A rejected reload must not change the adapter/state cache that
-                // the next attempt uses to preserve the currently live breakers.
-                let mut candidate_cache = cache_guard.clone();
-                match reload_live_config(backend, &mut candidate_cache, &prev, metrics).await {
-                    Ok(new_live) => {
-                        let mut live_guard = live.write().await;
-                        *cache_guard = candidate_cache;
-                        *live_guard = new_live;
-                        tracing::info!("Live config reloaded from backend");
-                    }
-                    Err(e) => {
-                        metrics.on_config_reload_failure("reload");
-                        tracing::warn!("Config reload failed: {e}");
-                    }
-                }
-            }
-
-            async fn reload_guard_chain_from_admin(
-                admin: &Option<Arc<dyn AdminStore>>,
-                live: &Arc<tokio::sync::RwLock<LiveConfig>>,
-                metrics: &Arc<dyn MetricsStore>,
-            ) {
-                if let Some(store) = admin {
-                    let guard_script_bodies =
-                        load_guard_script_bodies_from_admin(store.as_ref()).await;
-                    match store.get_proxy_setting("guardrails_config").await {
-                        Ok(Some(v)) => {
-                            let (global, groups) =
-                                build_guard_chains_from_db_value(&v, &guard_script_bodies);
-                            let mut w = live.write().await;
-                            w.guard_chain = global;
-                            w.group_guard_chains = groups;
-                        }
-                        Ok(None) => {
-                            let mut w = live.write().await;
-                            w.guard_chain = None;
-                            w.group_guard_chains = HashMap::new();
-                        }
-                        Err(e) => {
-                            metrics.on_config_reload_failure("guard_reload");
-                            tracing::warn!("Guard chain reload failed: {e}");
-                        }
-                    }
-                    // Catalog provider: same admin-store-only reload contract as guard
-                    // chains above — a `Null` provider is always a safe fallback (schema-aware
-                    // translation just degrades to dialect-only), unlike auth/authz.
-                    match store.get_proxy_setting("catalog_config").await {
-                        Ok(Some(v)) => {
-                            match serde_json::from_value::<
-                                queryflux_core::config::CatalogProviderConfig,
-                            >(v)
-                            {
-                                Ok(cfg) => {
-                                    let provider =
-                                        queryflux_catalog::build_catalog_provider(&cfg).await;
-                                    live.write().await.catalog = provider;
-                                }
-                                Err(e) => {
-                                    metrics.on_config_reload_failure("catalog_reload");
-                                    tracing::warn!("Catalog config parse failed: {e}");
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            live.write().await.catalog =
-                                Arc::new(queryflux_core::catalog::NullCatalogProvider);
-                        }
-                        Err(e) => {
-                            metrics.on_config_reload_failure("catalog_reload");
-                            tracing::warn!("Catalog config reload failed: {e}");
-                        }
-                    }
-                    match store.get_proxy_setting("access_control_config").await {
-                        Ok(Some(v)) => match apply_stored_access_control(&v) {
-                            Ok(guard) => {
-                                live.write().await.access_control_guard = guard;
-                            }
-                            Err(e) => {
-                                metrics.on_config_reload_failure("access_control_reload");
-                                tracing::warn!("Access control config parse/build failed: {e}");
-                            }
-                        },
-                        Ok(None) => {}
-                        Err(e) => {
-                            metrics.on_config_reload_failure("access_control_reload");
-                            tracing::warn!("Access control config reload failed: {e}");
-                        }
-                    }
-                }
-            }
-
-            async fn do_reload_or_guard(
-                backend: &Option<Arc<dyn BackendStore>>,
-                cache: &tokio::sync::Mutex<AdapterReloadCache>,
-                live: &Arc<tokio::sync::RwLock<LiveConfig>>,
-                admin: &Option<Arc<dyn AdminStore>>,
-                metrics: &Arc<dyn MetricsStore>,
-            ) {
-                if let Some(backend) = backend {
-                    do_reload(backend, cache, live, metrics).await;
-                } else {
-                    // YAML-mode reload contract: without a Postgres backend, routing rules,
-                    // cluster configs, and adapters are fixed at startup from the YAML file
-                    // and cannot change at runtime. Only guard chains (stored in the admin
-                    // store) can be hot-reloaded via the admin API. Routing or cluster
-                    // changes in YAML require a process restart.
-                    reload_guard_chain_from_admin(admin, live, metrics).await;
-                }
-            }
-
-            // Wrap the optional receiver so we can always select on it.
-            let mut revision_rx = revision_rx;
-
-            // Coalesce notification bursts: a bulk admin save bumps the revision
-            // once per write, and each bump is one channel message — without
-            // draining, N rapid writes would trigger N full reloads (adapter
-            // rebuilds included) on every replica. A short settle window lets
-            // writes a few hundred ms apart collapse into one reload too.
-            async fn coalesce_revisions(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) {
-                if let Some(rx) = rx.as_mut() {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    while rx.try_recv().is_ok() {}
-                }
-            }
-
-            // A future that resolves when the revision receiver gets a message,
-            // or pends forever if there is no receiver. A closed channel (the
-            // LISTEN/NOTIFY task died) drops the receiver so we don't spin on
-            // an immediately-ready `recv()`; periodic polling remains the
-            // safety net for config propagation.
-            async fn recv_revision(rx: &mut Option<tokio::sync::mpsc::Receiver<u64>>) -> u64 {
-                match rx {
-                    Some(r) => match r.recv().await {
-                        Some(rev) => rev,
-                        None => {
-                            tracing::warn!(
-                                "Config revision channel closed — falling back to periodic polling"
-                            );
-                            *rx = None;
-                            std::future::pending().await
-                        }
-                    },
-                    None => std::future::pending().await,
-                }
-            }
-
-            match periodic_secs {
-                None => loop {
-                    tokio::select! {
-                        _ = shutdown_rx.wait_for(|v| *v) => break,
-                        _ = notify.notified() => {
-                            tracing::debug!("Config reload triggered by local admin write");
-                        }
-                        rev = recv_revision(&mut revision_rx) => {
-                            tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
-                        }
-                    }
-                    coalesce_revisions(&mut revision_rx).await;
-                    do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics).await;
-                },
-                Some(interval_secs) => {
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-                    interval.tick().await; // skip the first immediate tick — startup already loaded
-                    loop {
-                        tokio::select! {
-                            _ = shutdown_rx.wait_for(|v| *v) => break,
-                            _ = interval.tick() => {}
-                            _ = notify.notified() => {
-                                tracing::debug!("Config reload triggered by local admin write");
-                            }
-                            rev = recv_revision(&mut revision_rx) => {
-                                tracing::debug!(revision = rev, "Config reload triggered by distributed revision change");
-                            }
-                        }
-                        coalesce_revisions(&mut revision_rx).await;
-                        do_reload_or_guard(&backend, &cache, &live, &admin_for_reload, &metrics)
-                            .await;
-                    }
-                }
-            }
-        }
-    });
+        let triggers = ReloadTriggers::new(
+            config_reload_notify.clone(),
+            revisions,
+            config.queryflux.periodic_config_reload_interval_secs(),
+        )
+        .await;
+        let source: Box<dyn ConfigSource> = match &backend {
+            Some(backend) => Box::new(PostgresConfigSource::new(backend.clone(), triggers)),
+            None => Box::new(AdminStoreConfigSource::new(
+                admin_store_for_reload,
+                triggers,
+            )),
+        };
+        let handles = LiveHandles {
+            live: live.clone(),
+            cache: adapter_reload_cache.clone(),
+            metrics: app_state.metrics.clone(),
+        };
+        tokio::spawn(run_reload_loop(source, handles, shutdown_rx.clone()));
+    }
 
     // Background task: health-check each cluster every 30s via its adapter.
     // Clusters with a custom `healthCheckQuery` use that SQL instead of `SELECT 1`.
@@ -2159,7 +1962,7 @@ mod tests {
         async fn reload(
             record: &queryflux_persistence::cluster_config::ClusterConfigRecord,
             cache: &mut AdapterReloadCache,
-        ) -> crate::LiveConfig {
+        ) -> queryflux_frontend::state::LiveConfig {
             let group: ClusterGroupConfig = serde_json::from_value(serde_json::json!({
                 "members": ["duck"],
                 "maxRunningQueries": 10
@@ -2177,7 +1980,7 @@ mod tests {
                 .expect("reload succeeds")
         }
 
-        async fn running(live: &crate::LiveConfig) -> u64 {
+        async fn running(live: &queryflux_frontend::state::LiveConfig) -> u64 {
             live.cluster_manager.all_cluster_states().await.unwrap()[0].running_queries
         }
 
