@@ -279,6 +279,8 @@ pub(crate) struct LiveConfigInputs {
     pub(crate) routers: Vec<queryflux_core::config::RouterConfig>,
     pub(crate) routing_fallback: String,
     pub(crate) group_translation_scripts: HashMap<String, Vec<String>>,
+    /// Applied by `apply_settings`, after `compile_live_config`.
+    pub(crate) settings: SettingsInputs,
 }
 
 impl LiveConfigInputs {
@@ -296,6 +298,37 @@ impl LiveConfigInputs {
             routers,
             routing_fallback,
             group_translation_scripts,
+            settings: SettingsInputs::default(),
+        }
+    }
+}
+
+/// Settings sections stored as JSON: `proxy_settings` rows in Postgres, and later the
+/// worker config snapshot. `None` means "never configured here"; the caller's previous
+/// (e.g. startup YAML) value stays in place.
+#[derive(Clone, Default)]
+pub(crate) struct SettingsInputs {
+    pub(crate) guardrails: Option<serde_json::Value>,
+    pub(crate) security: Option<serde_json::Value>,
+    pub(crate) catalog: Option<serde_json::Value>,
+    pub(crate) access_control: Option<serde_json::Value>,
+    /// Script library bodies referenced by guardrails, by script id.
+    pub(crate) guard_script_bodies: HashMap<i64, String>,
+}
+
+/// A settings section that failed to apply. `metric` is the
+/// `queryflux_config_reload_failures_total` reason label.
+#[derive(Clone, Debug)]
+pub(crate) struct SectionError {
+    pub(crate) metric: &'static str,
+    pub(crate) message: String,
+}
+
+impl SectionError {
+    fn new(metric: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            metric,
+            message: message.into(),
         }
     }
 }
@@ -323,11 +356,14 @@ impl ConfigIds {
 /// How `compile_live_config` treats a part that fails to build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompileMode {
-    /// Startup: an unknown group member, a strategy that fails to build or an unreadable
-    /// routing script rejects the whole config.
+    /// Any part that fails rejects the whole config: an unknown group member, a strategy
+    /// that fails to build, an unreadable routing script, or a settings section that does
+    /// not parse or build. Used at startup (clusters, groups, routing) and for worker
+    /// snapshot activation (everything).
     Strict,
-    /// Hot reload: log and degrade (skip the member, keep the group's previous strategy,
-    /// skip the router) so one bad row doesn't block every other change.
+    /// Hot reload on a standalone instance: log and degrade (skip the member, keep the
+    /// group's previous strategy, skip the router, keep a section's previous value) so one
+    /// bad row doesn't block every other change.
     Lenient,
 }
 
@@ -847,6 +883,107 @@ pub(crate) async fn compile_live_config(
     })
 }
 
+/// Apply the settings sections to a freshly compiled `LiveConfig`.
+///
+/// Sections that are `None` leave `live` as it is, so callers set `live`'s auth,
+/// authorization, guard chains, catalog and access control to the previous values
+/// first. `Lenient` applies every section that works and returns the failures (the
+/// failed sections keep their previous value). `Strict` returns an error if any
+/// section fails.
+pub(crate) async fn apply_settings(
+    live: &mut LiveConfig,
+    settings: &SettingsInputs,
+    groups: &HashMap<String, queryflux_core::config::ClusterGroupConfig>,
+    mode: CompileMode,
+) -> Result<Vec<SectionError>> {
+    let mut errors: Vec<SectionError> = Vec::new();
+
+    // Guardrails (UI-managed) replace the chains. An admin "clear" still writes an empty
+    // `global` row, so a missing value only means "never configured here".
+    if let Some(v) = &settings.guardrails {
+        let (global, groups) = build_guard_chains_from_db_value(v, &settings.guard_script_bodies);
+        live.guard_chain = global;
+        live.group_guard_chains = groups;
+    }
+
+    // Auth and authorization from the security section. Never fall back to permissive
+    // defaults: a failure keeps the previous providers.
+    if let Some(v) = settings
+        .security
+        .as_ref()
+        .filter(|v| !queryflux_core::security_setting::is_blank_security_setting(v))
+    {
+        let (auth_cfg, authz_cfg) = queryflux_core::security_setting::parse_security_setting(v);
+        match auth_cfg.as_ref().map(|cfg| build_auth_provider(cfg)) {
+            Some(Ok(provider)) => live.auth_provider = provider,
+            Some(Err(e)) => errors.push(SectionError::new(
+                "auth_rebuild",
+                format!("failed to build auth provider: {e}"),
+            )),
+            None => errors.push(SectionError::new(
+                "auth_rebuild",
+                "security_config has no recognizable auth section",
+            )),
+        }
+        match auth_cfg {
+            Some(auth) => {
+                let operators = operators_from_auth(&auth);
+                match authz_cfg.map(|cfg| build_authorization(&cfg, groups, operators)) {
+                    Some(Ok(checker)) => live.authorization = checker,
+                    Some(Err(e)) => errors.push(SectionError::new(
+                        "authz_rebuild",
+                        format!("failed to build authorization: {e}"),
+                    )),
+                    None => errors.push(SectionError::new(
+                        "authz_rebuild",
+                        "security_config has no recognizable authorization section",
+                    )),
+                }
+            }
+            None if authz_cfg.is_some() => errors.push(SectionError::new(
+                "authz_rebuild",
+                "security_config has authorization but no auth section (operator policy unchanged)",
+            )),
+            None => {}
+        }
+    }
+
+    // Catalog provider. A parse failure keeps the previous provider: never fall back to
+    // `NullCatalogProvider` and quietly stop discovering schema for working translation.
+    if let Some(v) = &settings.catalog {
+        match serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(v.clone()) {
+            Ok(cfg) => live.catalog = queryflux_catalog::build_catalog_provider(&cfg).await,
+            Err(e) => errors.push(SectionError::new(
+                "catalog_reload",
+                format!("catalog_config parse failed: {e}"),
+            )),
+        }
+    }
+
+    if let Some(v) = &settings.access_control {
+        match apply_stored_access_control(v) {
+            Ok(guard) => live.access_control_guard = guard,
+            Err(e) => errors.push(SectionError::new(
+                "access_control_reload",
+                format!("access_control_config parse/build failed: {e}"),
+            )),
+        }
+    }
+
+    if mode == CompileMode::Strict && !errors.is_empty() {
+        let detail: Vec<String> = errors
+            .iter()
+            .map(|e| format!("{}: {}", e.metric, e.message))
+            .collect();
+        anyhow::bail!(
+            "{} settings section(s) failed: {}",
+            errors.len(),
+            detail.join("; ")
+        );
+    }
+    Ok(errors)
+}
+
 fn build_router_chain(
     routers_cfg: &[queryflux_core::config::RouterConfig],
     routing_fallback: &str,
@@ -947,6 +1084,47 @@ fn build_router_chain(
     Ok(RouterChain::new(routers, fallback))
 }
 
+/// Read the settings sections from Postgres. A row that fails to read is left `None`
+/// (keep the previous value) and reported with its section's metric label.
+async fn read_settings(pg: &dyn BackendStore) -> (SettingsInputs, Vec<SectionError>) {
+    let mut errors = Vec::new();
+    let mut read = |key: &str, metric: &'static str, value| match value {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(SectionError::new(metric, format!("{key} read failed: {e}")));
+            None
+        }
+    };
+    let guardrails = read(
+        "guardrails_config",
+        "guard_reload",
+        pg.get_proxy_setting("guardrails_config").await,
+    );
+    let security = read(
+        "security_config",
+        "auth_rebuild",
+        pg.get_proxy_setting("security_config").await,
+    );
+    let catalog = read(
+        "catalog_config",
+        "catalog_reload",
+        pg.get_proxy_setting("catalog_config").await,
+    );
+    let access_control = read(
+        "access_control_config",
+        "access_control_reload",
+        pg.get_proxy_setting("access_control_config").await,
+    );
+    let settings = SettingsInputs {
+        guardrails,
+        security,
+        catalog,
+        access_control,
+        guard_script_bodies: load_guard_script_bodies(Some(pg as &dyn AdminStore)).await,
+    };
+    (settings, errors)
+}
+
 /// Load cluster/group configs + routing config from Postgres and build a fresh `LiveConfig`.
 /// Existing adapter instances are reused for clusters that haven't changed.
 ///
@@ -1017,143 +1195,37 @@ pub(crate) async fn reload_live_config(
             HashMap::new()
         });
     let group_translation_scripts = validate_group_translation_scripts(group_translation_scripts);
-    let guard_script_bodies = load_guard_script_bodies(Some(pg.as_ref() as &dyn AdminStore)).await;
-
-    let inputs = LiveConfigInputs::from_records(
+    let (settings, read_errors) = read_settings(pg.as_ref()).await;
+    let mut inputs = LiveConfigInputs::from_records(
         &cluster_records,
         cluster_groups,
         routers_cfg,
         routing_fallback,
         group_translation_scripts,
     );
+    inputs.settings = settings;
     let mut live = compile_live_config(&inputs, &ids, cache, CompileMode::Lenient).await?;
 
-    // Carry forward the pieces build_live_config seeds with placeholders. The
-    // DB reads below only *override* these on success — a missing row or a
-    // parse failure keeps the previous (startup-YAML or last-good) values.
+    // Carry forward the pieces `compile_live_config` seeds with placeholders. Settings
+    // only *override* these on success: a missing row or a failed section keeps the
+    // previous (startup-YAML or last-good) value.
     live.auth_provider = prev.auth_provider.clone();
     live.authorization = prev.authorization.clone();
     live.guard_chain = prev.guard_chain.clone();
     live.group_guard_chains = prev.group_guard_chains.clone();
-    // Startup already applied any stored `access_control_config` over the YAML; reload
-    // re-reads it below and overrides on success (same contract as catalog / guardrails).
     live.access_control_guard = prev.access_control_guard.clone();
     live.catalog = prev.catalog.clone();
 
-    // Guardrails from DB (UI-managed) override carried-over chains. An admin
-    // "clear" still writes an empty `global` row, so Ok(None) can only mean
-    // "never configured via admin" — keep the previous (e.g. YAML) chains.
-    match pg.get_proxy_setting("guardrails_config").await {
-        Ok(Some(v)) => {
-            let (global, groups) = build_guard_chains_from_db_value(&v, &guard_script_bodies);
-            live.guard_chain = global;
-            live.group_guard_chains = groups;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            metrics.on_config_reload_failure("guard_reload");
-            tracing::warn!("Reload: guardrails_config read failed; keeping previous chains: {e}")
-        }
-    }
-
-    // Rebuild auth/authz from persisted security config. On a missing row or
-    // any parse/build failure keep the carried-over providers — a reload must
-    // never fall back to permissive defaults.
-    match pg.get_proxy_setting("security_config").await {
-        Ok(Some(v)) if queryflux_core::security_setting::is_blank_security_setting(&v) => {}
-        Ok(Some(v)) => {
-            let (auth_cfg, authz_cfg) =
-                queryflux_core::security_setting::parse_security_setting(&v);
-            match auth_cfg.as_ref().map(|cfg| build_auth_provider(cfg)) {
-                Some(Ok(provider)) => live.auth_provider = provider,
-                Some(Err(e)) => {
-                    metrics.on_config_reload_failure("auth_rebuild");
-                    tracing::warn!("Reload: failed to rebuild auth provider; keeping previous: {e}")
-                }
-                None => {
-                    metrics.on_config_reload_failure("auth_rebuild");
-                    tracing::warn!(
-                        "Reload: security_config has no recognizable auth section; keeping previous"
-                    );
-                }
-            }
-            match auth_cfg {
-                Some(auth) => {
-                    let operators = operators_from_auth(&auth);
-                    match authz_cfg.map(|cfg| build_authorization(&cfg, &inputs.groups, operators))
-                    {
-                        Some(Ok(checker)) => live.authorization = checker,
-                        Some(Err(e)) => {
-                            metrics.on_config_reload_failure("authz_rebuild");
-                            tracing::warn!(
-                                "Reload: failed to rebuild authorization; keeping previous: {e}"
-                            )
-                        }
-                        None => {
-                            metrics.on_config_reload_failure("authz_rebuild");
-                            tracing::warn!(
-                            "Reload: security_config has no recognizable authorization section; keeping previous"
-                        );
-                        }
-                    }
-                }
-                None if authz_cfg.is_some() => {
-                    metrics.on_config_reload_failure("authz_rebuild");
-                    tracing::warn!(
-                        "Reload: security_config has authorization but no auth section; keeping previous authorization (operator policy unchanged)"
-                    );
-                }
-                None => {}
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            metrics.on_config_reload_failure("auth_rebuild");
-            tracing::warn!("Reload: security_config read failed; keeping previous auth: {e}")
-        }
-    }
-
-    // Rebuild the catalog provider from persisted config. A missing row means
-    // "never configured via admin" (keep the carried-over, e.g. startup-YAML,
-    // provider); a parse failure keeps the previous provider too — a reload must
-    // never silently fall back to `NullCatalogProvider` and quietly stop
-    // discovering schema for already-working translation.
-    match pg.get_proxy_setting("catalog_config").await {
-        Ok(Some(v)) => {
-            match serde_json::from_value::<queryflux_core::config::CatalogProviderConfig>(v) {
-                Ok(cfg) => live.catalog = queryflux_catalog::build_catalog_provider(&cfg).await,
-                Err(e) => {
-                    metrics.on_config_reload_failure("catalog_reload");
-                    tracing::warn!(
-                        "Reload: catalog_config parse failed; keeping previous catalog: {e}"
-                    )
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            metrics.on_config_reload_failure("catalog_reload");
-            tracing::warn!("Reload: catalog_config read failed; keeping previous catalog: {e}")
-        }
-    }
-
-    match pg.get_proxy_setting("access_control_config").await {
-        Ok(Some(v)) => match apply_stored_access_control(&v) {
-            Ok(guard) => live.access_control_guard = guard,
-            Err(e) => {
-                metrics.on_config_reload_failure("access_control_reload");
-                tracing::warn!(
-                    "Reload: access_control_config parse/build failed; keeping previous: {e}"
-                )
-            }
-        },
-        Ok(None) => {}
-        Err(e) => {
-            metrics.on_config_reload_failure("access_control_reload");
-            tracing::warn!(
-                "Reload: access_control_config read failed; keeping previous access control: {e}"
-            )
-        }
+    let errors = apply_settings(
+        &mut live,
+        &inputs.settings,
+        &inputs.groups,
+        CompileMode::Lenient,
+    )
+    .await?;
+    for e in read_errors.iter().chain(errors.iter()) {
+        metrics.on_config_reload_failure(e.metric);
+        tracing::warn!("Reload: {}; keeping previous", e.message);
     }
 
     Ok(live)
@@ -1347,6 +1419,89 @@ mod tests {
         assert!(compile(&i, &ConfigIds::default(), CompileMode::Lenient)
             .await
             .is_ok());
+    }
+
+    async fn compiled() -> LiveConfig {
+        let i = inputs(
+            vec![persisted(
+                "duck",
+                serde_json::json!({}),
+                serde_json::json!([]),
+            )],
+            vec![("g", group(serde_json::json!({ "members": ["duck"] })))],
+        );
+        compile(&i, &ConfigIds::default(), CompileMode::Strict)
+            .await
+            .expect("compiles")
+    }
+
+    /// One section that works (guardrails) and two that fail (catalog that does not
+    /// parse, security without an auth section).
+    fn mixed_settings() -> SettingsInputs {
+        SettingsInputs {
+            guardrails: Some(serde_json::json!({ "global": [] })),
+            security: Some(serde_json::json!({ "unrelated": true })),
+            catalog: Some(serde_json::json!({ "type": "notACatalogProvider" })),
+            ..SettingsInputs::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn lenient_settings_apply_what_works_and_keep_previous_for_failures() {
+        let mut live = compiled().await;
+        live.guard_chain = Some(Arc::new(GuardChain::new(Vec::new())));
+        let prev_auth = live.auth_provider.clone();
+        let prev_catalog = live.catalog.clone();
+
+        let errors = apply_settings(
+            &mut live,
+            &mixed_settings(),
+            &HashMap::new(),
+            CompileMode::Lenient,
+        )
+        .await
+        .expect("lenient never fails");
+
+        let metrics: Vec<&str> = errors.iter().map(|e| e.metric).collect();
+        assert_eq!(metrics, vec!["auth_rebuild", "catalog_reload"]);
+        assert!(live.guard_chain.is_none(), "guardrails section applied");
+        assert!(Arc::ptr_eq(&live.auth_provider, &prev_auth), "auth kept");
+        assert!(Arc::ptr_eq(&live.catalog, &prev_catalog), "catalog kept");
+    }
+
+    #[tokio::test]
+    async fn strict_settings_reject_the_config_if_any_section_fails() {
+        let mut live = compiled().await;
+        let err = apply_settings(
+            &mut live,
+            &mixed_settings(),
+            &HashMap::new(),
+            CompileMode::Strict,
+        )
+        .await
+        .expect_err("strict rejects");
+        let msg = err.to_string();
+        assert!(msg.contains("2 settings section(s) failed"), "{msg}");
+        assert!(
+            msg.contains("auth_rebuild") && msg.contains("catalog_reload"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_left_unset_change_nothing() {
+        let mut live = compiled().await;
+        let prev_auth = live.auth_provider.clone();
+        let errors = apply_settings(
+            &mut live,
+            &SettingsInputs::default(),
+            &HashMap::new(),
+            CompileMode::Strict,
+        )
+        .await
+        .expect("nothing to fail");
+        assert!(errors.is_empty());
+        assert!(Arc::ptr_eq(&live.auth_provider, &prev_auth));
     }
 
     /// Variant clusters have no row of their own; they get their parent's id.

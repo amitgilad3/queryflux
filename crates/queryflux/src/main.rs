@@ -627,6 +627,8 @@ async fn main() -> Result<()> {
         routers: config.routers.clone(),
         routing_fallback: config.routing_fallback.clone(),
         group_translation_scripts,
+        // Startup applies settings itself (YAML with DB overrides, below and above).
+        settings: Default::default(),
     };
     let ids = ConfigIds {
         clusters: cluster_ids_by_name,
