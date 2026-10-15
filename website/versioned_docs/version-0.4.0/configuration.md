@@ -1,0 +1,253 @@
+---
+sidebar_position: 1
+sidebar_label: YAML reference
+title: YAML Configuration Reference
+description: Complete config.yaml reference — frontends, cluster groups, routing rules, persistence, translation, and admin API settings.
+image: img/queryflux-hero-banner.png
+---
+# Configuration
+
+Copy `config.example.yaml` in the repository root and adjust for your environment.
+
+```yaml
+queryflux:
+  externalAddress: http://localhost:8080
+  frontends:
+    trinoHttp:
+      enabled: true
+      port: 8080
+    snowflakeHttp:
+      enabled: true
+      port: 8445
+  persistence:
+    type: inMemory  # or: postgres
+
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: http://trino-host:8080
+    enabled: true
+    auth:
+      type: basic
+      username: user
+      password: pass
+  duckdb-1:
+    engine: duckDb
+    enabled: true
+    databasePath: /tmp/queryflux.duckdb
+
+clusterGroups:
+  trino-default:
+    maxRunningQueries: 100
+    members: [trino-1]
+  duckdb-local:
+    maxRunningQueries: 4
+    members: [duckdb-1]
+
+routers:
+  - type: protocolBased
+    trinoHttp: trino-default
+    snowflakeHttp: trino-default
+    snowflakeSqlApi: trino-default
+
+  - type: header
+    headerName: x-target-engine
+    headerValueToGroup:
+      duckdb: duckdb-local
+
+routingFallback: trino-default
+```
+
+## SQL translation
+
+```yaml
+translation:
+  mode: bestEffort  # strict rejects required translation when unavailable or failed
+  errorOnUnsupported: false
+```
+
+`bestEffort` preserves the original SQL on translation failure. Use `strict` to reject
+the query before backend submission instead. Compatible dialects without fixups bypass
+translation; dialect-only fallback remains allowed when it succeeds. The legacy
+`errorOnUnsupported: true` option also enables strict behavior. Restart QueryFlux after
+changing this policy. See [Query translation](./architecture/query-translation) for
+fallback counters and query history outcomes.
+
+## Authentication, authorization & backend identity
+
+```yaml
+auth:
+  provider: oidc              # none | static | oidc | ldap
+  required: true
+  oidc:
+    issuer: https://keycloak.internal/realms/my-realm
+    jwksUri: https://keycloak.internal/realms/my-realm/protocol/openid-connect/certs
+    audience: queryflux
+
+authorization:
+  provider: none               # none | openfga
+
+clusters:
+  trino-1:
+    engine: trino
+    endpoint: https://trino.internal:8443
+    auth:                      # Type 1 — QueryFlux's own service credential
+      type: basic
+      username: qf_svc
+      password: "..."
+    queryAuth:
+      type: impersonate         # serviceAccount | passthrough | impersonate | tokenExchange
+```
+
+`auth` controls who can authenticate to QueryFlux; `authorization` controls which cluster groups they can route to; `clusters[].queryAuth` controls which identity the query runs as on the backend engine — independent of the client's own credential. See **[Authentication & identity](./authentication)** for the full picture, a decision guide for `queryAuth` modes, and per-engine setup requirements.
+
+## Access control
+
+```yaml
+accessControl:
+  enabled: true                     # default for cluster groups; false = opt-in per group
+  defaultConnection: prod           # groups without an override use this connection
+  connections:
+    prod:
+      provider: opa
+      opa:
+        url: http://localhost:8181
+        decisionPath: /v1/data/queryflux/access
+        timeoutMs: 1000
+      operations: [table.select]
+      onMissingSchema: evaluate
+      failOpen: false
+      cacheTtlMs: 5000
+      sessionParamKeys: [customer_id, tenant_id]
+  groups:
+    sandbox:
+      enabled: false
+```
+
+When set, QueryFlux connects to **OPA** and asks whether the verified identity may read each referenced table, then optionally rewrites SQL with row filters and column masks **before** dialect translation. QueryFlux does not author the policy (Rego stays in OPA).
+
+- **`enabled`** — global default for cluster groups; `false` means opt-in only where `groups.<name>.enabled: true`.
+- **`connections`** — named policy-provider connections. No name is reserved.
+- **`defaultConnection`** — which connection a group uses when it has no explicit `groups.<name>.connection` override. **Unset means such a group gets no access control at all.**
+- **`groups.<name>.enabled`** — per cluster group: inherit (omit), force on, or skip OPA (`false`).
+- **`groups.<name>.connection`** — route this group to a different named connection instead of `defaultConnection` (network segmentation, blast-radius isolation, provider migration — see [Multiple connections](./access-control/overview#multiple-connections)).
+- **Studio** — the **Access Control** page can add/edit/remove any number of connections and set `defaultConnection` + per-group scope.
+
+Omit the block (or `{ "enabled": false }` with no `connections`, via the Admin API) to disconnect. Full reference: **[Access control](./access-control/overview)** and **[OPA provider](./access-control/opa)**.
+
+## Admin API
+
+```yaml
+queryflux:
+  adminApi:
+    port: 9000            # Admin REST API + Studio proxy port (default: 9000)
+    username: admin       # Bootstrap admin username — see note below (default: admin)
+    password: admin       # Bootstrap admin password — see note below (default: admin)
+```
+
+`username` and `password` are the **bootstrap** credentials used on first boot. After you change the password through Studio's Security page, the new bcrypt hash is stored in Postgres and the YAML values are ignored.
+
+Environment variables `QUERYFLUX_ADMIN_USER` and `QUERYFLUX_ADMIN_PASSWORD` override the YAML fields and follow the same bootstrap semantics.
+
+See **[Studio & Admin Auth](./studio)** for the full credential priority rules and password-change instructions.
+
+## Persistence and distributed mode
+
+```yaml
+queryflux:
+  persistence:
+    type: postgres
+    postgres:
+      url: postgres://queryflux:queryflux@localhost:5433/queryflux
+  # Optional — defaults to true when postgres persistence is configured
+  distributed: true
+  configReloadIntervalSecs: 30
+```
+
+With **Postgres persistence** and **`distributed: true`** (the default when Postgres is configured), multiple QueryFlux replicas coordinate through Postgres:
+
+| Concern | Mechanism |
+|---|---|
+| Config hot-reload | `configReloadIntervalSecs` + immediate reload on Admin API writes |
+| Fleet-wide `maxRunningQueries` | Capacity leases in `cluster_capacity_leases` (`try_acquire` / `release`) |
+| Engine running counts | Reconcile sweep publishes to `cluster_capacity_counters.running` |
+| Queued query dispatch | Claim columns on `queued_queries` — one replica per query |
+
+Set `distributed: false` to run Postgres-backed persistence without cross-replica coordination (single replica or explicit opt-out).
+
+Helm / Kubernetes: see **[charts/queryflux/README.md](https://github.com/lakeops-org/queryflux/blob/main/charts/queryflux/README.md#persistence-and-replicas)**. Full behavior: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health#distributed-mode-and-capacitystore)**.
+
+## Query Cache
+
+QueryFlux can cache deterministic query results to avoid repeated backend roundtrips. See the dedicated **[Caching](./architecture/caching)** page for full documentation.
+
+Quick example:
+
+```yaml
+queryflux:
+  cacheBackend:
+    scheme: s3
+    compression: lz4
+    options:
+      bucket: queryflux-cache
+      endpoint: http://localhost:19000
+      region: us-east-1
+      access_key_id: rustfs-root-user
+      secret_access_key: rustfs-root-password
+
+clusterGroups:
+  analytics:
+    members: [trino-1]
+    maxRunningQueries: 50
+    cache:
+      enabled: true
+      ttlSecs: 300
+      maxEntrySizeMb: 64
+```
+
+---
+
+`config.example.yaml`, `config.local.yaml`, and the serde types in `queryflux-core` (`config.rs`) are the authoritative reference. For routing semantics and `clusterGroups`, see **[Routing and clusters](/docs/architecture/routing-and-clusters)**.
+
+## Cluster variants (multi-warehouse)
+
+ADBC clusters (`engine: adbc`) need their driver installed. The QueryFlux image ships none: declare them with `QUERYFLUX_ADBC_DRIVERS` (see **[ADBC drivers](./operations/adbc-drivers)**).
+
+A single cluster config can define **`variants`**: named overrides that expand into separate runtime clusters at load time. Use this when one credential set targets multiple Snowflake warehouses, Databricks SQL warehouses, BigQuery projects, or similar.
+
+```yaml
+clusters:
+  my-snowflake:
+    engine: adbc
+    driver: snowflake
+    uri: svc_user@myaccount/mydb/myschema
+    auth:
+      type: keyPair
+      username: SVC_ACCOUNT
+      privateKeyPem: "..."
+    # Optional — leave empty to use built-in Snowflake introspection
+    healthCheckQuery: "SHOW WAREHOUSES LIKE '{{sub_resource}}'"
+    variants:
+      - name: analytics
+        overrides:
+          warehouse: ANALYTICS_WH
+      - name: etl
+        overrides:
+          warehouse: ETL_WH
+          maxRunningQueries: 5
+
+clusterGroups:
+  snowflake-pool:
+    maxRunningQueries: 20
+    members:
+      - my-snowflake::analytics
+      - my-snowflake::etl
+```
+
+**Rules:**
+
+- Runtime names are `{base}::{variant_name}` (for example `my-snowflake::analytics`).
+- A cluster **with** variants does not create a runtime cluster for the base name alone.
+- `healthCheckQuery` and `reconcileQuery` are set on the **base** config; `{{sub_resource}}` is substituted per variant.
+
+Full details: **[Cluster variants, health checks & reconciliation](./architecture/cluster-variants-and-health)**.
