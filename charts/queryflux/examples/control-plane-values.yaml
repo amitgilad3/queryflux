@@ -10,6 +10,9 @@
 # Snapshots carry cluster credentials: terminate TLS in front of that port (mesh, or an
 # ingress) for anything but a trusted network.
 
+# The config is in a Secret the chart cannot read; this tells the install notes.
+role: controlPlane
+
 replicaCount: 2
 
 config:
